@@ -27,6 +27,8 @@ Use the following commands:
 
 References:
 	Thanks
-	->Mona.py : https://github.com/corelan/mona
-	->Crashwrangler : https://developer.apple.com/library/mac/technotes/tn2334/_index.html
-	->Metasploit : https://github.com/rapid7/metasploit-framework
+	-Mona.py : https://github.com/corelan/mona
+
+	-Crashwrangler : https://developer.apple.com/library/mac/technotes/tn2334/_index.html
+
+	-Metasploit : https://github.com/rapid7/metasploit-framework
