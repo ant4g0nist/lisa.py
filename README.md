@@ -24,3 +24,9 @@ Use the following commands:
 	Crash accessing invalid address.
 
 (As of now, commiting exploitable command. Have to test the remaining code.)
+
+References:
+	Thanks
+	->Mona.py : https://github.com/corelan/mona
+	->Crashwrangler : https://developer.apple.com/library/mac/technotes/tn2334/_index.html
+	->Metasploit : https://github.com/rapid7/metasploit-framework
