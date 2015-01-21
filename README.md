@@ -1,17 +1,17 @@
 # lisa.py
 -An Exploit Dev Swiss Army Knife. 
--mona.py for OSX
+-mona.py for Mac OS X
 
 #Usage:
 
 Copy lisa.py and /lldbinit to ~/ 
 Use the following commands:
 
-	ant4g0nist$cp lisa.py ~/lisa.py
+	ant4g0nist$ cp lisa.py ~/lisa.py
 
-	ant4g0nist$cp .lldbinit ~/.lldbinit
+	ant4g0nist$ cp .lldbinit ~/.lldbinit
 
-	ant4g0nist$lldb
+	ant4g0nist$ lldb
 	
 (When a process crashes while debugging, run exploitable command to get the output)
 
