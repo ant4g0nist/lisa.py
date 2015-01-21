@@ -1,0 +1,6 @@
+settings set prompt "(lisa)"
+settings set target.x86-disassembly-flavor intel
+command script import ~/lisa.py
+command script import lldb
+command script add -f lisa.alias lisa
+lisa
