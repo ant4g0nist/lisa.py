@@ -25,8 +25,7 @@ Use the following commands:
 
 (As of now, commiting exploitable command. Have to test the remaining code.)
 
-References:
-	Thanks
+Thanks:
 
 	-Mona.py : https://github.com/corelan/mona
 
