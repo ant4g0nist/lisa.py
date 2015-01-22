@@ -34,3 +34,5 @@ Thanks:
 	-Metasploit : https://github.com/rapid7/metasploit-framework
 	
 	-PEDA :	https://github.com/longld/peda
+	
+	-Phillips https://www.phillips321.co.uk/2013/04/02/recreating-pattern_create-rb-in-python/
