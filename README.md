@@ -7,7 +7,7 @@
 
 #Usage:
 
-Copy lisa.py and /lldbinit to ~/ 
+Copy lisa.py and .lldbinit to ~/ 
 Use the following commands:
 
 	ant4g0nist$ cp lisa.py ~/lisa.py
