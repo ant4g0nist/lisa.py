@@ -32,3 +32,5 @@ Thanks:
 	-Crashwrangler : https://developer.apple.com/library/mac/technotes/tn2334/_index.html
 
 	-Metasploit : https://github.com/rapid7/metasploit-framework
+	
+	-PEDA :	https://github.com/longld/peda
