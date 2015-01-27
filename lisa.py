@@ -298,58 +298,56 @@ def so(debugger,command,result,dict):
     execute(debugger,"ct",result,dict)
     execute(debugger,"thread step-over",result,dict)
 
-def testjump(self, inst=None):
+def testjump(debugger,command,result,dict):
         """
         Test if jump instruction is taken or not
         Returns:
             - (status, address of target jumped instruction)
         """
-
-        flags = self.get_eflags()
+        inst=None
+        flags = get_eflags(debugger,command,result,dict)
         if not flags:
             return None
 
         if not inst:
-            pc = getregvalue("pc")
-            inst = self.execute_redirect("x/i 0x%x" % pc)
+            pc =getregvalue(debugger,"pc",result,dict)
+            inst = executeReturnOutput(debugger,"x/i "+ pc,result,dict)
             if not inst:
                 return None
 
-        opcode = inst.split(":")[1].split()[0]
-        next_addr = self.eval_target(inst)
-        if next_addr is None:
-            next_addr = 0
+        opcode = inst.split('  ')[2]
+
 
         if opcode == "jmp":
-            return next_addr
+            return True
         if opcode == "je" and flags["ZF"]:
-            return next_addr
+            return True
         if opcode == "jne" and not flags["ZF"]:
-            return next_addr
+            return True
         if opcode == "jg" and not flags["ZF"] and (flags["SF"] == flags["OF"]):
-            return next_addr
+            return True
         if opcode == "jge" and (flags["SF"] == flags["OF"]):
-            return next_addr
+            return True
         if opcode == "ja" and not flags["CF"] and not flags["ZF"]:
-            return next_addr
+            return True
         if opcode == "jae" and not flags["CF"]:
-            return next_addr
+            return True
         if opcode == "jl" and (flags["SF"] != flags["OF"]):
-            return next_addr
+            return True
         if opcode == "jle" and (flags["ZF"] or (flags["SF"] != flags["OF"])):
-            return next_addr
+            return True
         if opcode == "jb" and flags["CF"]:
-            return next_addr
+            return True
         if opcode == "jbe" and (flags["CF"] or flags["ZF"]):
-            return next_addr
+            return True
         if opcode == "jo" and flags["OF"]:
-            return next_addr
+            return True
         if opcode == "jno" and not flags["OF"]:
-            return next_addr
+            return True
         if opcode == "jz" and flags["ZF"]:
-            return next_addr
+            return True
         if opcode == "jnz" and flags["OF"]:
-            return next_addr
+            return True
 
         return None
 
@@ -369,35 +367,18 @@ def context(debugger,command,result,dict):
     op=executeReturnOutput(debugger,"register read",result,dict)
     print tty_colors.red()+"[*] Registers\t:"+tty_colors.default()
     print op.split("\n\n")[0].split('General Purpose Registers:\n')[1].split('eflags')[0]
-    
-    print "[*] Elfags\t:"
 
-    eflags=get_eflags(debugger,command,result,dict)
-    if eflags!=None:
-        for i in eflags.keys():
-            print eflags[i]
+    jumpto = testjump(debugger,command,result,dict)
+    if jumpto:
+        code = executeReturnOutput(debugger,"disassemble -c 1 -s $pc",result,dict)
+        destAddr=code.split('  ')[4]
+        if ';' in code:
+            destFunc=code.split(';')[1]
+            print tty_colors.red()+"[*] Jumping to\t:"+destFunc+tty_colors.default()
+            return
+        destCode=executeReturnOutput(debugger,"disassemble -c 1 -s "+destAddr,result,dict)
+        print tty_colors.red()+"[*] Jumping to code\t:"+destCode+tty_colors.default()
 
-
-# def stepnInstructions(debugger, n, result, internal_dict):
-#     """
-#         Steps n number of instructions
-        
-#         Usage Eg: sf 12
-
-#         Output: prints registers before n after running n instructions
-#     """
-
-#     try:
-#         n=int(n)
-#         thread = debugger.GetSelectedTarget().GetProcess().GetSelectedThread()
-#         start_num_frames = thread.GetNumFrames()
-#         if start_num_frames == 0:
-#             return
-#         execute(debugger,'register read',result,internal_dict)
-#         thread.StepInstruction(n)
-#         execute(debugger,'register read',result,internal_dict)
-#     except:
-#         print 'Usage Eg: sf 12'
 
 def get_eflags(debugger,command,result,dict):
     """
