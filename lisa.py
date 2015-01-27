@@ -283,7 +283,158 @@ def executeReturnOutput(debugger,lldb_command,result,dict):
     output=res.GetOutput()
     return output
 
+def s(debugger,command,result,dict):
+    """step command"""
+    execute(debugger,"ct",result,dict)
+    execute(debugger,"thread step-in",result,dict)
 
+def si(debugger,command,result,dict):
+    """step into command"""
+    execute(debugger,"ct",result,dict)
+    execute(debugger,"thread step-inst",result,dict)
+
+def so(debugger,command,result,dict):
+    """step over"""
+    execute(debugger,"ct",result,dict)
+    execute(debugger,"thread step-over",result,dict)
+
+def testjump(self, inst=None):
+        """
+        Test if jump instruction is taken or not
+        Returns:
+            - (status, address of target jumped instruction)
+        """
+
+        flags = self.get_eflags()
+        if not flags:
+            return None
+
+        if not inst:
+            pc = getregvalue("pc")
+            inst = self.execute_redirect("x/i 0x%x" % pc)
+            if not inst:
+                return None
+
+        opcode = inst.split(":")[1].split()[0]
+        next_addr = self.eval_target(inst)
+        if next_addr is None:
+            next_addr = 0
+
+        if opcode == "jmp":
+            return next_addr
+        if opcode == "je" and flags["ZF"]:
+            return next_addr
+        if opcode == "jne" and not flags["ZF"]:
+            return next_addr
+        if opcode == "jg" and not flags["ZF"] and (flags["SF"] == flags["OF"]):
+            return next_addr
+        if opcode == "jge" and (flags["SF"] == flags["OF"]):
+            return next_addr
+        if opcode == "ja" and not flags["CF"] and not flags["ZF"]:
+            return next_addr
+        if opcode == "jae" and not flags["CF"]:
+            return next_addr
+        if opcode == "jl" and (flags["SF"] != flags["OF"]):
+            return next_addr
+        if opcode == "jle" and (flags["ZF"] or (flags["SF"] != flags["OF"])):
+            return next_addr
+        if opcode == "jb" and flags["CF"]:
+            return next_addr
+        if opcode == "jbe" and (flags["CF"] or flags["ZF"]):
+            return next_addr
+        if opcode == "jo" and flags["OF"]:
+            return next_addr
+        if opcode == "jno" and not flags["OF"]:
+            return next_addr
+        if opcode == "jz" and flags["ZF"]:
+            return next_addr
+        if opcode == "jnz" and flags["OF"]:
+            return next_addr
+
+        return None
+
+def context(debugger,command,result,dict):
+    """
+        Prints context of current execution context
+        Usage:
+            ct
+    """
+
+
+    #stack
+    op=executeReturnOutput(debugger,"x/10x $sp",result,dict)
+    print tty_colors.red()+"[*] Stack :\n"+tty_colors.default()
+    print tty_colors.blue()+op+tty_colors.default()
+    #registers
+    op=executeReturnOutput(debugger,"register read",result,dict)
+    print tty_colors.red()+"[*] Registers\t:"+tty_colors.default()
+    print op.split("\n\n")[0].split('General Purpose Registers:\n')[1].split('eflags')[0]
+    
+    print "[*] Elfags\t:"
+
+    eflags=get_eflags(debugger,command,result,dict)
+    if eflags!=None:
+        for i in eflags.keys():
+            print eflags[i]
+
+
+# def stepnInstructions(debugger, n, result, internal_dict):
+#     """
+#         Steps n number of instructions
+        
+#         Usage Eg: sf 12
+
+#         Output: prints registers before n after running n instructions
+#     """
+
+#     try:
+#         n=int(n)
+#         thread = debugger.GetSelectedTarget().GetProcess().GetSelectedThread()
+#         start_num_frames = thread.GetNumFrames()
+#         if start_num_frames == 0:
+#             return
+#         execute(debugger,'register read',result,internal_dict)
+#         thread.StepInstruction(n)
+#         execute(debugger,'register read',result,internal_dict)
+#     except:
+#         print 'Usage Eg: sf 12'
+
+def get_eflags(debugger,command,result,dict):
+    """
+    Get flags value from EFLAGS register
+
+    Returns:
+    - dictionary of named flags
+    """
+
+    # Eflags bit masks, source vdb
+    EFLAGS_CF = 1 << 0
+    EFLAGS_PF = 1 << 2
+    EFLAGS_AF = 1 << 4
+    EFLAGS_ZF = 1 << 6
+    EFLAGS_SF = 1 << 7
+    EFLAGS_TF = 1 << 8
+    EFLAGS_IF = 1 << 9
+    EFLAGS_DF = 1 << 10
+    EFLAGS_OF = 1 << 11
+
+    flags = {"CF":0, "PF":0, "AF":0, "ZF":0, "SF":0, "TF":0, "IF":0, "DF":0, "OF":0}
+    eflags = getregvalue(debugger,"eflags",result,dict)
+
+    if not eflags:
+        eflags = getregvalue(debugger,"rflags",result,dict)
+    eflags=int(eflags,16)
+    flags["CF"] = bool(eflags & EFLAGS_CF)
+    flags["PF"] = bool(eflags & EFLAGS_PF)
+    flags["AF"] = bool(eflags & EFLAGS_AF)
+    flags["ZF"] = bool(eflags & EFLAGS_ZF)
+    flags["SF"] = bool(eflags & EFLAGS_SF)
+    flags["TF"] = bool(eflags & EFLAGS_TF)
+    flags["IF"] = bool(eflags & EFLAGS_IF)
+    flags["DF"] = bool(eflags & EFLAGS_DF)
+    flags["OF"] = bool(eflags & EFLAGS_OF)
+
+    return flags
 #create html report
 def report(debugger, command, result, dict):
     
@@ -491,10 +642,10 @@ def getregvalue(debugger,reg,result,dict):
 
 
 #return whether or not the base pointer is far away from the stack pointer.
-def bp_inconsistent_with_sp():
+def bp_inconsistent_with_sp(debugger,command,result,dict):
     #define MAX_DISTANCE (PAGE_SIZE * 10)
-    bp_val = getregvalue("bp");
-    sp_val = getregvalue("sp");
+    bp_val = getregvalue(debugger,"bp",result,dict);
+    sp_val = getregvalue(debugger,"sp",result,dict);
     #    No check if bp_val > sp_val since bp_val - sp_val may have underflowed.
     if (bp_val - sp_val) > MAX_DISTANCE:
         return True
@@ -781,7 +932,7 @@ def exploitable(debugger,command,result,dict):
             print tty_colors.red()+"Unknown exception number %d\n"%exception+tty_colors.default()
             is_exploitable = "yes"
             print tty_colors.red()+"is_exploitable = %s"%is_exploitable+tty_colors.default()
-        if not g_ignore_frame_pointer and exception=="EXC_BAD_ACCESS" and bp_inconsistent_with_sp():
+        if not g_ignore_frame_pointer and exception=="EXC_BAD_ACCESS" and bp_inconsistent_with_sp(debugger,command,result,dict):
             is_exploitable = "yes"
             print tty_colors.red()+"is_exploitable = %s"%is_exploitable+tty_colors.default()
             print tty_colors.red()+"Presumed exploitable based on the discrepancy between the stack pointer and base pointer registers. If -fomit-frame-pointer was used to build the code, set the CW_IGNORE_FRAME_POINTER env variable."+tty_colors.default()
@@ -797,5 +948,9 @@ def alias(debugger,commands,result,dict):
     execute(debugger,'command script add --function lisa.pattern_create pattern_create',result,dict)
     execute(debugger,'command script add --function lisa.pattern_offset pattern_offset',result,dict)
     execute(debugger,'command script add --function lisa.check_if_cyclic check_if_cyclic',result,dict)
-
+    execute(debugger,'command script add --function lisa.stepnInstructions sf',result,dict)
+    execute(debugger,'command script add --function lisa.context ct',result,dict)
+    execute(debugger,'command script add --function lisa.s s',result,dict)
+    execute(debugger,'command script add --function lisa.si si',result,dict)
+    execute(debugger,'command script add --function lisa.so so',result,dict)
 tty_colors = TerminalColors (True)
