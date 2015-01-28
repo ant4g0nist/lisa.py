@@ -285,24 +285,35 @@ def executeReturnOutput(debugger,lldb_command,result,dict):
 
 def s(debugger,command,result,dict):
     """step command"""
-    execute(debugger,"ct",result,dict)
-    execute(debugger,"thread step-in",result,dict)
+    context(debugger,command,result,dict)
+    # execute(debugger,"thread step-in",result,dict)
+    
+    debugger.SetAsync(False)
+    lldb.thread.StepInto()
+    debugger.SetAsync (True)
+
 
 def si(debugger,command,result,dict):
     """step into command"""
-    execute(debugger,"ct",result,dict)
-    execute(debugger,"thread step-inst",result,dict)
+    context(debugger,command,result,dict)
+    # execute(debugger,"thread step-inst",result,dict)
+    
+    debugger.SetAsync(False)
+    lldb.thread.StepInstruction(True)
+    debugger.SetAsync (True)
 
 def so(debugger,command,result,dict):
     """step over"""
-    execute(debugger,"ct",result,dict)
-    execute(debugger,"thread step-over",result,dict)
+    context(debugger,command,result,dict)    
+    debugger.SetAsync(False)
+    lldb.thread.StepOver()
+    debugger.SetAsync (True)
 
 def testjump(debugger,command,result,dict):
         """
         Test if jump instruction is taken or not
         Returns:
-            - (status, address of target jumped instruction)
+            True if jump is taken or False if not 
         """
         inst=None
         flags = get_eflags(debugger,command,result,dict)
@@ -316,7 +327,6 @@ def testjump(debugger,command,result,dict):
                 return None
 
         opcode = inst.split('  ')[2]
-
 
         if opcode == "jmp":
             return True
@@ -349,7 +359,7 @@ def testjump(debugger,command,result,dict):
         if opcode == "jnz" and flags["OF"]:
             return True
 
-        return None
+        return False
 
 def context(debugger,command,result,dict):
     """
@@ -357,28 +367,31 @@ def context(debugger,command,result,dict):
         Usage:
             ct
     """
-
+    #disas
+    op=executeReturnOutput(debugger,"disassemble -c 2 -s $pc",result,dict)
+    print op
 
     #stack
     op=executeReturnOutput(debugger,"x/10x $sp",result,dict)
     print tty_colors.red()+"[*] Stack :\n"+tty_colors.default()
     print tty_colors.blue()+op+tty_colors.default()
+
     #registers
     op=executeReturnOutput(debugger,"register read",result,dict)
     print tty_colors.red()+"[*] Registers\t:"+tty_colors.default()
     print op.split("\n\n")[0].split('General Purpose Registers:\n')[1].split('eflags')[0]
 
-    jumpto = testjump(debugger,command,result,dict)
-    if jumpto:
-        code = executeReturnOutput(debugger,"disassemble -c 1 -s $pc",result,dict)
-        destAddr=code.split('  ')[4]
-        if ';' in code:
-            destFunc=code.split(';')[1]
-            print tty_colors.red()+"[*] Jumping to\t:"+destFunc+tty_colors.default()
-            return
-        destCode=executeReturnOutput(debugger,"disassemble -c 1 -s "+destAddr,result,dict)
-        print tty_colors.red()+"[*] Jumping to code\t:"+destCode+tty_colors.default()
+    #jump
+    dis=executeReturnOutput(debugger,'disassemble -c 1 -s $pc',result,dict).split(':  ')[1].split()[0]
+    if 'j' in dis:
+        jumpto = testjump(debugger,command,result,dict)
 
+        if jumpto==True:
+            code = executeReturnOutput(debugger,"disassemble -c 1 -s $pc",result,dict)
+            destAddr=code.split('  ')[4]
+            if ';' in code:
+                destFunc=code.split(';')[1]
+                print tty_colors.red()+"[*] Jumping to\t:"+destFunc+tty_colors.default()
 
 def get_eflags(debugger,command,result,dict):
     """
