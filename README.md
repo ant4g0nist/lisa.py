@@ -1,6 +1,5 @@
 # lisa.py
 -An Exploit Dev Swiss Army Knife. 
--mona.py for Mac OS X
 
 ![alt tag](https://raw.githubusercontent.com/ant4g0nist/lisa.py/master/lisa.png)
 
