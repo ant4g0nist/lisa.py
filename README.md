@@ -14,6 +14,9 @@ Use the following commands:
 	ant4g0nist$ cp .lldbinit ~/.lldbinit
 
 	ant4g0nist$ lldb
+
+To initialize the lisa session after attaching to a process, run 
+	(lisa)script lldb.thread
 	
 (When a process crashes while debugging, run exploitable command to get the output)
 
