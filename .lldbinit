@@ -4,3 +4,4 @@ command script import ~/lisa.py
 command script import lldb
 command script add -f lisa.alias lisa
 lisa
+banner
