@@ -13,11 +13,10 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
- 
+
 import os
 import re
 import sys
-import lldb
 import time
 import shlex
 import random
@@ -29,13 +28,17 @@ import optparse
 import platform
 from struct import *
 from sys import version_info
+import httplib
 
-lisaversion = 'v-ichi'
+import lldb
+
+#global vars#
+lisaversion = 'v-ni'
 PAGE_SIZE=4096
 MAX_DISTANCE=PAGE_SIZE*10
-g_ignore_frame_pointer= True
-g_exploitable_jit = True
+g_ignore_frame_pointer= False
 reportexploitable=""
+###################
 
 REGISTERS = {
     8 : ["al", "ah", "bl", "bh", "cl", "ch", "dl", "dh"],
@@ -48,8 +51,7 @@ REGISTERS = {
 ####################################
 #             Misc Utils           #
 ####################################
-
-def banner():
+def banner(debugger,command,result,dict):
     
     lisa2="""
         
@@ -72,7 +74,6 @@ def banner():
         """
     print tty_colors.green()+random.choice([lisa2])+tty_colors.default()
     print tty_colors.red()+"\t-An Exploit Dev Swiss Army Knife. Version: "+lisaversion+tty_colors.default()
-
 
 #convert to hex
 def to_hex(var):
@@ -115,7 +116,6 @@ def shell(debugger,command,result,dict):
     return
 
 #term colors
-
 class TerminalColors:
     '''Simple terminal colors class'''
     def __init__(self, enabled = True):
@@ -267,61 +267,55 @@ class TerminalColors:
 ####################################
 #       LLDB                       #
 ####################################
-#step,stepinto functions for these like in lisa
 
 #set malloc debugging features
 def setMallocDebug(debugger,c,result,dict):
-    """
-       sets DYLD_INSERT_LIBRARIES to /usr/lib/libgmalloc.dylib
-    """
+    """sets DYLD_INSERT_LIBRARIES to /usr/lib/libgmalloc.dylib"""
     execute(debugger,'settings set target.env-vars DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib',result,dict)
     return True
-
 
 #execute given LLDB command
 def execute(debugger,lldb_command,result,dict):
     """
         Execute given command and print the outout to stdout
     """
-    debugger=lldb.debugger
     debugger.HandleCommand(lldb_command)
 
 #execute command and return output
 def executeReturnOutput(debugger,lldb_command,result,dict):
-    """
-        Execute given command and returns the outout
-    """
+    """Execute given command and returns the outout"""
     ci = debugger.GetCommandInterpreter()
     res=lldb.SBCommandReturnObject()
     ci.HandleCommand(lldb_command,res)
-    output=res.GetOutput()
-    return output
+    output= res.GetOutput()
+    error  = res.GetError()
+    return (output,error)
 
 def s(debugger,command,result,dict):
     """step command"""
+    executeReturnOutput(debugger,"thread step-in",result,dict)
     context(debugger,command,result,dict)
-    # execute(debugger,"thread step-in",result,dict)
-    
-    debugger.SetAsync(False)
-    lldb.thread.StepInto()
-    debugger.SetAsync (True)
-
 
 def si(debugger,command,result,dict):
     """step into command"""
+    executeReturnOutput(debugger,"thread step-inst",result,dict)
     context(debugger,command,result,dict)
-    # execute(debugger,"thread step-inst",result,dict)
-    
-    debugger.SetAsync(False)
-    lldb.thread.StepInstruction(True)
-    debugger.SetAsync (True)
 
 def so(debugger,command,result,dict):
     """step over"""
-    context(debugger,command,result,dict)    
-    debugger.SetAsync(False)
-    lldb.thread.StepOver()
-    debugger.SetAsync (True)
+    executeReturnOutput(debugger,"thread step-over",result,dict)
+    context(debugger,command,result,dict)
+
+def stepnInstructions(debugger,count,result,dict):
+    """step-in n time"""
+    c=0
+
+    while c<int(count):
+        command=""
+        executeReturnOutput(debugger,"thread step-in",result,dict)
+        c+=1
+
+    context(debugger,command,result,dict)
 
 def testjump(debugger,command,result,dict):
         """
@@ -336,76 +330,83 @@ def testjump(debugger,command,result,dict):
 
         if not inst:
             pc =getregvalue(debugger,"pc",result,dict)
-            inst = executeReturnOutput(debugger,"x/i "+ pc,result,dict)
+
+            inst, error = executeReturnOutput(debugger,"x/1i $pc",result,dict)
             if not inst:
                 return None
 
-        opcode = inst.split('  ')[2]
+        opcode = inst.split('  ')[2]    
 
         if opcode == "jmp":
-            return True
+            return (True,inst.split('  ')[4])
         if opcode == "je" and flags["ZF"]:
-            return True
+            print inst.split('  ')[4]
+            return (True,inst.split('  ')[4])
         if opcode == "jne" and not flags["ZF"]:
-            return True
+            return (True,inst.split('  ')[4])
         if opcode == "jg" and not flags["ZF"] and (flags["SF"] == flags["OF"]):
-            return True
+            return (True,inst.split('  ')[4])
         if opcode == "jge" and (flags["SF"] == flags["OF"]):
-            return True
+            return (True,inst.split('  ')[4])
         if opcode == "ja" and not flags["CF"] and not flags["ZF"]:
-            return True
+            return (True,inst.split('  ')[4])
         if opcode == "jae" and not flags["CF"]:
-            return True
+            return (True,inst.split('  ')[4])
         if opcode == "jl" and (flags["SF"] != flags["OF"]):
-            return True
+            return (True,inst.split('  ')[4])
         if opcode == "jle" and (flags["ZF"] or (flags["SF"] != flags["OF"])):
-            return True
+            return (True,inst.split('  ')[4])
         if opcode == "jb" and flags["CF"]:
-            return True
+            return (True,inst.split('  ')[4])
         if opcode == "jbe" and (flags["CF"] or flags["ZF"]):
-            return True
+            return (True,inst.split('  ')[4])
         if opcode == "jo" and flags["OF"]:
-            return True
+            return (True,inst.split('  ')[4])
         if opcode == "jno" and not flags["OF"]:
-            return True
+            return (True,inst.split('  ')[4])
         if opcode == "jz" and flags["ZF"]:
-            return True
+            return (True,inst.split('  ')[4])
         if opcode == "jnz" and flags["OF"]:
-            return True
+            return (True,inst.split('  ')[4])
 
-        return False
+        return (False,None)
 
 def context(debugger,command,result,dict):
-    """
-        Prints context of current execution context
-        Usage:
-            ct
-    """
-    #disas
-    op=executeReturnOutput(debugger,"disassemble -c 2 -s $pc",result,dict)
-    print op
+    """Prints context of current execution"""
+    
+    try:
+        #disas
+        op, error=executeReturnOutput(debugger,"disassemble -c 2 -s $pc",result,dict)
+        print tty_colors.red()+"[*] Disassembly :\n"+tty_colors.default()
+        print op
 
-    #stack
-    op=executeReturnOutput(debugger,"x/10x $sp",result,dict)
-    print tty_colors.red()+"[*] Stack :\n"+tty_colors.default()
-    print tty_colors.blue()+op+tty_colors.default()
+        #stack
+        op, error=executeReturnOutput(debugger,"x/10x $sp",result,dict)
+        print tty_colors.red()+"[*] Stack :\n"+tty_colors.default()
+        print tty_colors.blue()+op+tty_colors.default()
 
-    #registers
-    op=executeReturnOutput(debugger,"register read",result,dict)
-    print tty_colors.red()+"[*] Registers\t:"+tty_colors.default()
-    print op.split("\n\n")[0].split('General Purpose Registers:\n')[1].split('eflags')[0]
+        #registers
+        op, error=executeReturnOutput(debugger,"register read",result,dict)
+        print tty_colors.red()+"[*] Registers\t:"+tty_colors.default()
+        print op.split("\n\n")[0].split('General Purpose Registers:\n')[1].split('eflags')[0]
+        print '\n'
 
-    #jump
-    dis=executeReturnOutput(debugger,'disassemble -c 1 -s $pc',result,dict).split(':  ')[1].split()[0]
-    if 'j' in dis:
-        jumpto = testjump(debugger,command,result,dict)
+        #jump
+        dis, error=executeReturnOutput(debugger,'disassemble -c 1 -s $pc',result,dict)
+        if dis:
+            dis = dis.split(': ')[1].split()[0]
 
-        if jumpto==True:
-            code = executeReturnOutput(debugger,"disassemble -c 1 -s $pc",result,dict)
-            destAddr=code.split('  ')[4]
-            if ';' in code:
-                destFunc=code.split(';')[1]
-                print tty_colors.red()+"[*] Jumping to\t:"+destFunc+tty_colors.default()
+            if 'j' in dis:
+                jumpto, destination = testjump(debugger,command,result,dict)
+                if jumpto==True:
+                    print tty_colors.red()+"[*] Jumping to\t:"+destination+tty_colors.default()
+                else:
+                    print tty_colors.red()+"[*] Jump not taken."+tty_colors.default()
+        else:
+            print error,
+
+    except Exception as e:
+        print 'error running context'
 
 def get_eflags(debugger,command,result,dict):
     """
@@ -443,87 +444,17 @@ def get_eflags(debugger,command,result,dict):
     flags["OF"] = bool(eflags & EFLAGS_OF)
 
     return flags
-#create html report
-def report(debugger, command, result, dict):
-    
-    filename=lldb.target.executable.basename+"_"+str(lldb.process.id)+"_"+str(int(time.time()))+".html"
-    description='''Export the state of current target into a crashlog file'''
-    
-    out_file = open(filename, 'w')
-    if not out_file:
-        result.PutCString ("error: failed to open file '%s' for writing...", args[0]);
-        return
-    out_file.write("<html><title>LISA eXploit Report</title>\n")
-    
-    if lldb.target:
-        out_file.write("<body><p>")
-        identifier = lldb.target.executable.basename
-        if lldb.process:
-            pid = lldb.process.id
-            if pid != lldb.LLDB_INVALID_PROCESS_ID:
-                out_file.write('Process:         %s [%u]</br>' % (identifier, pid))
-        out_file.write('Path:            %s</br>' % (lldb.target.executable.fullpath))
-        out_file.write('Identifier:      %s</br>' % (identifier))
-        out_file.write('\nDate/Time:       %s</br>' % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-        out_file.write('OS Version:      Mac OS X %s (%s)</br>' % (platform.mac_ver()[0], commands.getoutput('sysctl -n kern.osversion')));
-        out_file.write('Report Version:  9</br>')
-        out_file.write('Exploitable: '+reportexploitable+'</br>')
-        for thread_idx in range(lldb.process.num_threads):
-            thread = lldb.process.thread[thread_idx]
-            out_file.write('\nThread %u:\n</br>' % (thread_idx))
-            for (frame_idx, frame) in enumerate(thread.frames):
-                frame_pc = frame.pc
-                frame_offset = 0
-                if frame.function:
-                    block = frame.GetFrameBlock()
-                    block_range = block.range[frame.addr]
-                    if block_range:
-                        block_start_addr = block_range[0]
-                        frame_offset = frame_pc - block_start_addr.load_addr
-                    else:
-                        frame_offset = frame_pc - frame.function.addr.load_addr
-                elif frame.symbol:
-                    frame_offset = frame_pc - frame.symbol.addr.load_addr
-                out_file.write('%-3u %-32s 0x%16.16x %s</br>' % (frame_idx, frame.module.file.basename, frame_pc, frame.name))
-                if frame_offset > 0:
-                    out_file.write(' + %u</br>' % (frame_offset))
-                line_entry = frame.line_entry
-                if line_entry:
-                    if options.verbose:
-                        # This will output the fullpath + line + column
-                        out_file.write(' %s</br>' % (line_entry))
-                    else:
-                        out_file.write(' %s:%u</br>' % (line_entry.file.basename, line_entry.line))
-                        column = line_entry.column
-                        if column:
-                            out_file.write(':%u</br>' % (column))
-                out_file.write('\n</br>')
 
-        out_file.write('\nBinary Images:\n</br>')
-        for module in lldb.target.modules:
-                text_segment = module.section['__TEXT']
-                if text_segment:
-                        text_segment_load_addr = text_segment.GetLoadAddress(lldb.target)
-                        if text_segment_load_addr != lldb.LLDB_INVALID_ADDRESS:
-                            text_segment_end_load_addr = text_segment_load_addr + text_segment.size
-                            identifier = module.file.basename
-                            module_version = '???'
-                            module_version_array = module.GetVersion()
-                            if module_version_array:
-                                module_version = '.'.join(map(str,module_version_array))
-                            out_file.write ('    0x%16.16x - 0x%16.16x  %s (%s - ???) <%s> %s\n</br>' % (text_segment_load_addr, text_segment_end_load_addr, identifier, module_version, module.GetUUIDString(), module.file.fullpath))
-        out_file.write("</p></body></html>")
-        out_file.close()
-    else:
-        result.PutCString ("error: invalid target");
 
 ####################################
-#   Exploitation                   #
+#         Exploitation             #
 ####################################
 
 
 #pattern create and pattern offset
-def pattern_create(debugger,size,result,dict,returnv=False):
+def pattern_create(debugger,size,result,dict):
+    """creates a cyclic pattern of given length"""
+
     try:length=int(size)
     except:print "[+] Usage: pattern_create <length> [set a] [set b] [set c]"
     seta="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -538,18 +469,23 @@ def pattern_create(debugger,size,result,dict,returnv=False):
         if c == len(setc):c=0;b+=1
         if b == len(setb):b=0;a+=1
         if a == len(seta):a=0
-    if not returnv:
-        print tty_colors.red()+ string[:length]+tty_colors.default()
+    
+    print tty_colors.red()+ string[:length]+tty_colors.default()
 
-    if returnv:
-        return string[:length]
+    return string[:length]
 
 #check if given pattern is in cyclic pattern
-def check_if_cyclic(debugger,pat,result,dict,ret=False):
+def check_if_cyclic(debugger,pat,result,dict):
+    """check if given pattern is in cyclic pattern"""
+
     seta="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     setb="abcdefghijklmnopqrstuvwxyz"
     setc="0123456789"
     
+    if not pat:
+        print '[+] Usage: check_if_cyclic <some string>'
+        return
+
     string=pat ; a=0 ; b=0 ; c=0
     length=len(string)
     i=0
@@ -592,18 +528,17 @@ def check_if_cyclic(debugger,pat,result,dict,ret=False):
 
         i+=3
     print "seems to be a valid pattern"
-    if ret==True:
-        return True
+    return True
 
 #pattern search
 def pattern_offset(debugger,sizepat,result,dict):
-    """[*] search offset of pattern."""
+    """search offset of pattern."""
     
     if len(sizepat.split(' '))==2:
         try:
             size=int(sizepat.split(' ')[0])
             pat=sizepat.split(' ')[1]
-            pattern=pattern_create(debugger,size,result,dict,True)
+            pattern=pattern_create(debugger,size,result,dict)
             if "0x" in pat:
                 pat=pat.replace("0x","")
                 pat=pat.decode("hex")[::-1]
@@ -613,9 +548,8 @@ def pattern_offset(debugger,sizepat,result,dict):
             except:
                 pass
             found=[m.start() for m in re.finditer(pat, pattern)]
-#                found=pattern.find(pat)
             if found!=-1:
-                print found
+                print 'offsets:',found
         except:
             print "please check the syntax"
             print "pattern_offset 250 Aa2A"
@@ -641,324 +575,503 @@ def pattern_offset(debugger,sizepat,result,dict):
             print "please check the syntax"
             print "pattern_offset 250 Aa2A"
 
-
-
 #return address in register
 def getregvalue(debugger,reg,result,dict):
-    output=executeReturnOutput(debugger,'register read '+reg,result,dict)
+    output,error=executeReturnOutput(debugger,'register read '+reg,result,dict)
     return output.split("= ")[-1].split(" ")[0]
 
+lldb_stop_reasons =  { 'eStateCrashed' : 8, 'eStateDetached' : 9, 'eStateExited' : 10, 'eStateInvalid' : 0,
+                      'eStateLaunching' : 4, 'eStateRunning' : 6, 'eStateStepping' : 7,'eStateStopped' : 5,
+                      'eStateSuspended' : 11, 'eStopReasonBreakpoint' : 3, 'eStopReasonException' : 6,
+                      'eStopReasonExec' : 7, 'eStopReasonInvalid' : 0, 'eStopReasonNone' : 1, 'eStopReasonSignal' : 5,
+                      'eStopReasonThreadExiting' : 9, 'eStopReasonTrace' : 2, 'eStopReasonWatchpoint' : 4
+                      }
 
-#return whether or not the base pointer is far away from the stack pointer.
-def bp_inconsistent_with_sp(debugger,command,result,dict):
-    #define MAX_DISTANCE (PAGE_SIZE * 10)
-    bp_val = getregvalue(debugger,"bp",result,dict);
-    sp_val = getregvalue(debugger,"sp",result,dict);
-    #    No check if bp_val > sp_val since bp_val - sp_val may have underflowed.
-    if (bp_val - sp_val) > MAX_DISTANCE:
-        return True
-    return False
-def is_stack_suspicious(access_address):
-    if access_address=="0xbbadbeef":
-        is_exploitable="no"
-        return
-    if exception=="EXC_BREAKPOINT":
-        return
-    suspicious_functions = [
-            " __stack_chk_fail ", " szone_error ", " CFRelease ", " CFRetain ", " _CFRelease ", " _CFRetain",
-            " malloc ", " calloc ", " realloc ",  " objc_msgSend",
-            " szone_free ", " free_small ", " tiny_free_list_add_ptr ", " tiny_free_list_remove_ptr ",
-            " small_free_list_add_ptr ", " small_free_list_remove_ptr ", " large_entries_free_no_lock ",
-            " large_free_no_lock ", " szone_batch_free ", " szone_destroy ", " free ",
-            " CSMemDisposeHandle ",  " CSMemDisposePtr ",
-            " append_int ", " release_file_streams_for_task ", " __guard_setup ",
-            " _CFStringAppendFormatAndArgumentsAux ", " WTF::fastFree ", " WTF::fastMalloc ",
-            " WTF::FastCalloc ", " WTF::FastRealloc ", "  WTF::tryFastCalloc ", " WTF::tryFastMalloc ",
-            " WTF::tryFastRealloc ", " WTF::TCMalloc_Central_FreeList ", " GMfree ", " GMmalloc_zone_free ",
-            " GMrealloc ", " GMmalloc_zone_realloc "]
-    stack=executeReturnOutput("bt")
-    if "0   ???" in stack:
-        print tty_colors.red()+"This crash is suspected to be exploitable because the crashing instruction is outside of a known function, i.e. in dynamically generated code"+tty_colors.default()
-        reportexploitable="This crash is suspected to be exploitable because the crashing instruction is outside of a known function, i.e. in dynamically generated code"
-        is_exploitable = "yes"
-        return
-    MINIMUM_RECURSION_LENGTH = 300
-    stack_length= len(stack.split("\n"))
-    if stack_length>MINIMUM_RECURSION_LENGTH:
-        print tty_colors.red()+"The crash is suspected to be not exploitable due to unbounded recursion since there were %d stack frames."+tty_colors.default()
-        reportexploitable="The crash is suspected to be not exploitable due to unbounded recursion since there were %d stack frames."
-        is_exploitable = "no"
-        return
-    for i in suspicious_functions:
-        if i in stack:
-            if exception == "EXC_BREAKPOINT" and (i==" CFRelease " or i==" CFRetain "):
-                is_exploitable = "no"
-                return
-            elif i==" _CFRelease " or i==" CFRelease " and "CGContextDelegateFinalize" in stack:
-                return
-            elif i==" objc_msgSend" and access_address<<PAGE_SIZE:
-                continue
-            else:
-                print tty_colors.red()+"The crash is suspected to be an exploitable issue due to the suspicious function in the stack trace of the crashing thread"%i+tty_colors.default()
-                reportexploitable="The crash is suspected to be an exploitable issue due to the suspicious function in the stack trace of the crashing thread."
-                is_exploitable = "yes"
-                return
-    return
+def getexception(exception_description):
+    type1  = exception_description
+    try:
+        exception = re.search("EXC_(.+?) ",type1).group().strip(' ')
+    except:
+        exception = None
+    try:
+        code =  re.search("\(code(.+?),",type1).group().split('=')[1].strip(',')
+    except:
+        try:
+            code =  re.search("\(code(.+?)\)",type1).group().split('=')[1].strip(')')
+        except:
+            code = None
+    try:
+        address  = re.search(", address(.+?)\)",type1).group().split('=')[1].strip(')')
+    except:
+        address = None
+
+    return exception,code,address
+
+def getsignal(signal_description):
+    return signal_description.split(' ')[1]
 
 
-#get disassembly
-def getdisassembly(debugger,c,result,dict):
-    disas=executeReturnOutput(debugger,"disassemble -c 1 -s $pc",result,dict).split('\n')[1].split(':')[1]
-    return disas
-
-#get exception
-def getexception(debugger,c,result,dict):
-    output=executeReturnOutput(debugger,"process status",result,dict)
-    s1=output.find("stop reason =")
-    s2=output[s1:].find("(")
-    return output[s1:s1+s2].replace("stop reason =",'')
-
-#get exception address
-def getexceptionaddr(debugger,c,result,dict):
-    output=executeReturnOutput(debugger,"process status",result,dict)
-    s1=output.find("address=")
-    s2=output[s1:].find(")")
-    return output[s1:s1+s2].replace("address=",'')
-
-#reg should be a 2 character string like ax, di, dx, not necessarily null terminated.
-def value_for_register(debugger,reg,result,dict):
-    if reg[1:]=="ax":
-        return getregvalue(debugger,'rax',result,dict)
-    elif reg[1:]=="bx":
-        return getregvalue(debugger,'rbx',result,dict);
-    elif reg[1:]=="cx":
-        return getregvalue(debugger,'rcx',result,dict)
-    elif reg[1:]=="dx":
-        return getregvalue(debugger,'rdx',result,dict)
-    elif reg[1:]=="di":
-        return getregvalue(debugger,'rdi',result,dict)
-    elif reg[1:]=="si":
-        return getregvalue(debugger,'rsi',result,dict)
-    elif reg[1:]=="sp":
-        return getregvalue(debugger,'rsp',result,dict)
-    elif reg[1:]=="bp":
-        return getregvalue(debugger,'rbp',result,dict)
-    else:
-        print "ERROR: unexpected register %s\n"%reg
-        sys.exit()
-
-def stack_access_crash(debugger, access_address,result,dict):
-    access_address=int(access_address,0)
-    sp_val = int(getregvalue(debugger,"sp",result,dict),0)
-    if ((sp_val - access_address) <= PAGE_SIZE):
-        return True
-    return False
-
-def value_for_first_register(debugger, disassembly,result,dict):
-    first_left_paren = disassembly.find('[')
-    first_reg = disassembly[first_left_paren+1:first_left_paren+4];
-
-    return value_for_register(debugger, first_reg,result,dict)
-
-
-def type_for_two_memory(debugger,disassembly,access_address,result,dict):
-    first_reg_val = value_for_first_register(debugger,disassembly,result,dict)
+def type_for_two_memory(access_address, disassembly):
+    first_reg_val = value_for_first_register(disassembly)
     if first_reg_val != access_address:
         return "read"
     else:
         return "write"
 
+def stack_access_crash(access_address, sp_val):
+    access_address=int(access_address,0)
+    sp_val = int(sp_val,0)
+    if ((sp_val - access_address) <= PAGE_SIZE):
+        return True
+    return False
 
-#get exception type
-def getexceptiontype(debugger,disassembly,result,dict):
-    last_comma = disassembly.find(',')
-    right_paren = disassembly.find(']')
+def getexceptiontype(access_address, disassembly, registers):
+    if disassembly!=None:
+        last_comma = disassembly.find(',')
+        right_paren = disassembly.find(']')
 
-    access_address=getexceptionaddr(debugger,"",result,dict)
-    if disassembly[right_paren+1:].find(']')!=-1:
-        type=type_for_two_memory(debugger,disassembly, access_address,result,dict)
-        return type
-    elif disassembly.find('call')!=-1:
-        if not right_paren or last_comma:
-            type = "recursion"
-        elif stack_access_crash(debugger,access_address,result,dict):
-            type = "recursion"
-        else:
-            type = "exec"
-        return type
-    elif disassembly.find("cmp")!=-1 or disassembly.find("test")!=-1 or disassembly.find("fld")!=-1:
-        type = "read"
-        return type
-    elif disassembly.find("fst")!=-1:
-        type = "write"
-        return type
-    elif disassembly.find("mov")!=-1:
-        if getregvalue(debugger, disassembly[last_comma-3:last_comma],result,dict)!=access_address:
-            type = "read"
-        else:
-            type = "write"
-        return type
-    elif disassembly.find('jmp')!=-1:
-        type = "exec"
-        return type
-    elif disassembly.find('push')!=-1:
-        if right_paren:
-            type = "read"
-        else:
-            type = "recursion"
-        return type
-    elif disassembly.find('inc')!=-1 or disassembly.find('dec')!=-1:
-        type = "write"
-        return type
-    elif disassembly.find("stos")!=-1:
-        type = "write"
-        return type
-    elif disassembly.find("lods")!=-1:
-        type = "read"
-        return type
-    else:
-        type = "unknown"
-        return type
-    if disassembly.find("st") == 2:
-        type = "write"
-        return type
-    elif disassembly.find("ld") == 2:
-        type = "read"
-        return type
-    elif disassembly.find("push") == 2:
-        type = "recursion"
-        return type
-    else:
-        type = "unknown"
-        return type
+        sp = registers['sp']
 
+        if disassembly[right_paren+1:].find(']')!=-1:
+            type_=type_for_two_memory(access_address, disassembly)
+            return type_
 
-
-#eStateAttaching = 3
-#eStateConnected = 2
-#eStateCrashed = 8
-#eStateDetached = 9
-#eStateExited = 10
-#eStateInvalid = 0
-#eStateLaunching = 4
-#eStateRunning = 6
-#eStateStepping = 7
-#eStateStopped = 5
-#eStateSuspended = 11
-#eStateUnloaded = 1
-#eStopReasonBreakpoint = 3
-#eStopReasonException = 6
-#eStopReasonExec = 7
-#eStopReasonInvalid = 0
-#eStopReasonNone = 1
-#eStopReasonPlanComplete = 8
-#eStopReasonSignal = 5
-#eStopReasonThreadExiting = 9
-#eStopReasonTrace = 2
-#eStopReasonWatchpoint = 4
-
-#check if exploitable or not
-
-def exploitable(debugger,command,result,dict):
-    """[*] checks if the crash is exploitable"""
-    global reportexploitable
-    disassembly=None
-    access_type=None
-    
-    stopreason=lldb.thread.stop_reason
-    if stopreason==lldb.eStopReasonSignal:
-        signal=lldb.thread.GetStopDescription(30)
-        if "SIGABRT" in signal:
-            bt=executeReturnOutput(debugger,"bt",result,dict)
-            if "__stack_chk_fail" in bt:
-                print tty_colors.red()+"Seems like a stack overflow. Found suspicious function '"+bt[bt.find("__stack_chk_fail"):bt.find("__stack_chk_fail")+len("__stack_chk_fail")]+"' in the execution stack"+tty_colors.default()
-                reportexploitable="Seems like a stack overflow. Found suspicious function "+bt[bt.find("__stack_chk_fail"):bt.find("__stack_chk_fail")+len("__stack_chk_fail")]+" in the execution stack"
-                return
-    if stopreason==lldb.eStopReasonException:
-        rip=getregvalue(debugger,"$rip",result,dict)
-        exception=getexception(debugger,"",result,dict).strip(' ')
-        disassembly=getdisassembly(debugger,"",result,dict)
-        access_type= getexceptiontype(debugger,disassembly,result,dict)
-        access_address=getexceptionaddr(debugger,"",result,dict)
-            
-        """case 1: accessing invalid address"""
-        if access_address==getregvalue(debugger, "pc",result,dict):
-            print tty_colors.red()+"Trying to execute a bad address, this is a potentially exploitable issue\n"+tty_colors.default()
-            print tty_colors.red()+"exploitable = yes"+tty_colors.default()
-            reportexploitable="Trying to execute a bad address, this is a potentially exploitable issue\nexploitable = yes"
-            access_type = "exec"
-
-        elif exception=="EXC_BAD_ACCESS":
-            if access_type=="exec":
-                is_exploitable = "yes"
-                addr = access_address
-                max_offset = 1024
-                if (addr > 0x55555555 - max_offset and addr < 0x55555555 + max_offset):
-                    print tty_colors.red()+"The access address indicates the use of freed memory if MallocScribble was used, or uninitialized memory if libgmalloc and MALLOC_FILL_SPACE was used."+tty_colors.default()
-                    reportexploitable="The access address indicates the use of freed memory if MallocScribble was used, or uninitialized memory if libgmalloc and MALLOC_FILL_SPACE was used."
-                if (addr > 0xaaaaaaaa - max_offset and addr < 0xaaaaaaaa + max_offset):
-                    print tty_colors.red()+"The access address indicates that uninitialized memory was being used if MallocScribble was used.\n"+tty_colors.default()
-                    reportexploitable="The access address indicates that uninitialized memory was being used if MallocScribble was used.\n"
-                
-                elif access_type=="recursion":
-                    is_exploitable = "no"
-                else:
-                    is_exploitable="yes"
-            if exception == "EXC_I386_GPFLT":
-                print tty_colors.red()+"The exception code indicates that the access address was invalid in the 64-bit ABI (it was > 0x0000800000000000).\n"+tty_colors.default()
-                reportexploitable="The exception code indicates that the access address was invalid in the 64-bit ABI (it was > 0x0000800000000000).\n"
-            if access_address<PAGE_SIZE:
-                print tty_colors.blue()+"Null Dereference. Probably not exploitable"+tty_colors.default()
-                reportexploitable="Null Dereference. Probably not exploitable"
+        elif disassembly.find('call')!=-1:
+            if not right_paren or last_comma:
+                type_ = "recursion"
+            elif stack_access_crash(access_address,sp):
+                print 'ohhh'
+                type_ = "recursion"
             else:
-                is_exploitable="yes"
-                print tty_colors.red()+"is_exploitable = %s"%is_exploitable+tty_colors.default()
-                print tty_colors.red()+"Crash accessing invalid address. "+tty_colors.default()
-                reportexploitable= "Crash accessing invalid address.\nexploitable = yes"
-        elif exception=="EXC_BAD_INSTRUCTION":
-            is_exploitable = "yes"
-            print tty_colors.red()+"is_exploitable = %s"%is_exploitable+tty_colors.default()
-            print tty_colors.blue()+"Illegal instruction at 0x%016qx, probably a exploitable issue unless the crash was in libdispatch/xpc."+tty_colors.default()
-            reportexploitable="Illegal instruction at 0x%016qx, probably a exploitable issue unless the crash was in libdispatch/xpc.\nexploitable = yes"
-        elif exception=="EXC_ARITHMETIC":
-            is_exploitable = "no"
-            print tty_colors.blue()+"is_exploitable = %s"%is_exploitable+tty_colors.default()
-            print tty_colors.blue()+"Arithmetic exception at 0x%016qx, probably not exploitable."+tty_colors.default()
-            reportexploitable="Arithmetic exception at 0x%016qx, probably not exploitable."
-        elif exception=="EXC_SOFTWARE":
-            is_exploitable = "no"
-            print tty_colors.blue()+"is_exploitable = %s"%is_exploitable+tty_colors.default()
-            print tty_colors.blue()+"Software exception.\n"+tty_colors.default()
-            reportexploitable="Software exception, probably not exploitable.\n"
-        elif exception=="EXC_BREAKPOINT":
-            is_exploitable = "no"
-            print tty_colors.blue()+"is_exploitable = %s"%is_exploitable+tty_colors.default()
-        elif exception=="EXC_CRASH":
-            is_exploitable= "no"
-            print tty_colors.blue()+"is_exploitable = %s"%is_exploitable+tty_colors.default()
+                type_ = "exec"
+            return type_
+
+        elif disassembly.find("cmp")!=-1 or disassembly.find("test")!=-1 or disassembly.find("fld")!=-1:
+            type_ = "read"
+            return type_
+
+        elif disassembly.find("fst")!=-1:
+            type_ = "write"
+            return type_
+
+        elif disassembly.find("mov")!=-1:
+            if last_comma>right_paren:
+                type_ = "read"
+            else:
+                type_ = "write"
+            return type_
+
+        elif disassembly.find('jmp')!=-1:
+            type_ = "exec"
+            return type_
+
+        elif disassembly.find('push')!=-1:
+            if right_paren:
+                type_ = "read"
+            else:
+                type_ = "recursion"
+            return type_
+
+        elif disassembly.find('inc')!=-1 or disassembly.find('dec')!=-1:
+            type_ = "write"
+            return type_
+
+        elif disassembly.find("stos")!=-1:
+            type_ = "write"
+            return type_
+
+        elif disassembly.find("lods")!=-1:
+            type_ = "read"
+            return type_
+
         else:
-            print tty_colors.red()+"Unknown exception number %d\n"%exception+tty_colors.default()
-            is_exploitable = "yes"
-            print tty_colors.red()+"is_exploitable = %s"%is_exploitable+tty_colors.default()
-        if not g_ignore_frame_pointer and exception=="EXC_BAD_ACCESS" and bp_inconsistent_with_sp(debugger,command,result,dict):
-            is_exploitable = "yes"
-            print tty_colors.red()+"is_exploitable = %s"%is_exploitable+tty_colors.default()
-            print tty_colors.red()+"Presumed exploitable based on the discrepancy between the stack pointer and base pointer registers. If -fomit-frame-pointer was used to build the code, set the CW_IGNORE_FRAME_POINTER env variable."+tty_colors.default()
-            reportexploitable="Presumed exploitable based on the discrepancy between the stack pointer and base pointer registers. If -fomit-frame-pointer was used to build the code, set the CW_IGNORE_FRAME_POINTER env variable.\nexploitable = yes"
+            type_ = "unknown"
+            return type_
+
+        if disassembly.find("st") == 2:
+            type_ = "write"
+            return type_
+
+        elif disassembly.find("ld") == 2:
+            type_ = "read"
+            return type_
+
+        elif disassembly.find("push") == 2:
+            type_ = "recursion"
+            return type_
+
+        else:
+            type_ = "unknown"
+            return type_
+
+    else:
+        type_ = "unknown"
+        return type_
+
+def is_stack_suspicious(exc_address, exception, backtrace):
+    global reportexploitable
+    global is_exploitable
+
+    suspicious_functions = [
+            "__chk_fail", "__stack_chk_fail", "szone_error", "CFRelease", "CFRetain", "_CFRelease", "_CFRetain",
+           "malloc", "calloc", "realloc", "objc_msgSend",
+           "szone_free", "free_small", "tiny_free_list_add_ptr", "tiny_free_list_remove_ptr",
+           "small_free_list_add_ptr", "small_free_list_remove_ptr", "large_entries_free_no_lock",
+           "large_free_no_lock", "szone_batch_free", "szone_destroy", "free",
+           "CSMemDisposeHandle", "CSMemDisposePtr",
+           "append_int", "release_file_streams_for_task", "__guard_setup",
+           "_CFStringAppendFormatAndArgumentsAux", "WTF::fastFree", "WTF::fastMalloc",
+           "WTF::FastCalloc", "WTF::FastRealloc", " WTF::tryFastCalloc", "WTF::tryFastMalloc",
+           "WTF::tryFastRealloc", "WTF::TCMalloc_Central_FreeList", "GMfree", "GMmalloc_zone_free",
+           "GMrealloc", "GMmalloc_zone_realloc"]
+
+    if exc_address=="0xbbadbeef":
+        # WebCore functions call CRASH() in various assertions or if the amount to allocate was too big. CRASH writes a null byte to 0xbbadbeef.
+        is_exploitable=False
+        print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()        
+        reportexploitable = "Not exploitable. Seems to be a safe crash. Calls to CRASH() function writes a null byte to 0xbbadbeef"
+        print tty_colors.red()+"Not exploitable. Seems to be a safe crash. Calls to CRASH() function writes a null byte to 0xbbadbeef"+tty_colors.default()
+
+        return
+
+    if "0   ???" in backtrace:
+        is_exploitable = True
+        print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
+        print tty_colors.red()+"This crash is suspected to be exploitable because the crashing instruction is outside of a known function, i.e. in dynamically generated code"+tty_colors.default()
+        reportexploitable="This crash is suspected to be exploitable because the crashing instruction is outside of a known function, i.e. in dynamically generated code"
+        return
+
+    for i in suspicious_functions:
+        if i in backtrace:
+            if exception == "EXC_BREAKPOINT" and (i=="CFRelease" or i=="CFRetain"):
+                is_exploitable = "no"
+                return
+            elif i=="_CFRelease" or i=="CFRelease" and "CGContextDelegateFinalize" in backtrace:
+                return
+            elif i=="objc_msgSend" and exc_address<<PAGE_SIZE:
+                continue
+            else:
+                is_exploitable = True
+                print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
+                print tty_colors.red()+"The crash is suspected to be an exploitable issue due to the suspicious function in the stack trace of the crashing thread: "+i+tty_colors.default()
+                reportexploitable="The crash is suspected to be an exploitable issue due to the suspicious function in the stack trace of the crashing thread."
+                return
+
+#return whether or not the base pointer is far away from the stack pointer.
+def bp_inconsistent_with_sp(bp_val,sp_val):
+    #define MAX_DISTANCE (PAGE_SIZE * 10)
+    #    No check if bp_val > sp_val since bp_val - sp_val may have underflowed.
+
+    if (int(bp_val,0) - int(sp_val,0)) > MAX_DISTANCE:
+        return True
+    return False
+
+class Lisa:
+    def __init__(self, debugger,result,dict):
+        
+        self.debugger = debugger
+        self.target = self.debugger.GetSelectedTarget()
+        self.process = self.target.process
+        self.thread = self.process.selected_thread
+        self.frame = self.thread.GetFrameAtIndex(0)
+        self.pc = hex(self.frame.pc)
+        self.sp = hex(self.frame.sp)
+        self.bp = hex(self.frame.fp)
+
+        disas,disas_error = executeReturnOutput(debugger,"disassemble -c 1 -s $pc",result,dict)
+
+        if disas_error:
+            self.pc_disas = None
+        else:
+            self.pc_disas = re.search("->(.+?)\n",disas).group().split(':')[1]
+
+        self.backtrace, self.backtrace_error = executeReturnOutput(debugger,"bt",result,dict)
+
+        self.crash_reason = self.thread.GetStopReason()
+        
+        if self.crash_reason == lldb_stop_reasons['eStopReasonException']:
+            self.exception = self.thread.GetStopDescription(80)
+            self.exception,self.exc_code,self.exc_address = getexception(self.exception)
+            self.signal = None
+
+            print tty_colors.red()+"Exception : "+self.exception+tty_colors.default()
+
+        elif self.crash_reason == lldb_stop_reasons['eStopReasonSignal']:
+            self.signal = self.thread.GetStopDescription(80)
+            self.signal = getsignal(self.signal)
+            self.exc_address = None
+            self.exception = None
+
+            print tty_colors.red()+"Signal : "+self.signal+tty_colors.default()
+            
+        else:
+            return
+
+        self.gen_registers =  list(self.frame.registers)[0]
+        self.registers = {}
+
+        for i in  self.gen_registers.__iter__():
+            self.registers[i.name]=i.value
+
+        max_offset = 1024
+        if self.exception:
+            if self.exception=="EXC_BAD_ACCESS":
+                # check pc == access_address
+                
+                if self.exc_address and int(self.exc_address,0)==int(self.pc,0):
+                    # IP over write
+                    is_exploitable = True
+                    print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
+                    print tty_colors.red()+"Trying to execute a bad address, this is a potentially exploitable issue"+tty_colors.default()
+                    reportexploitable="Trying to execute a bad address, this is a potentially exploitable issue"
+
+                else:
+                    self.access_type = getexceptiontype(self.exc_address, self.pc_disas, self.registers)
+                    
+                    if self.exc_address and int(self.exc_address,16)<int(PAGE_SIZE):
+                        is_exploitable=False
+                        print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
+                        print tty_colors.blue()+"Null Dereference. Probably not exploitable"+tty_colors.default()
+                        reportexploitable="Null Dereference. Probably not exploitable"
+                        return
+
+                    elif self.access_type == "recursion":
+                        is_exploitable=False
+
+                        stack=self.backtrace
+                        MINIMUM_RECURSION_LENGTH = 300
+                        stack_length= len(stack.split("\n"))
+
+                        if stack_length>MINIMUM_RECURSION_LENGTH:
+                            print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
+                            print tty_colors.red()+"The crash is suspected to be not exploitable due to unbounded recursion since there were %d stack frames."%stack_length+tty_colors.default()
+                            reportexploitable="The crash is suspected to be not exploitable due to unbounded recursion since there were %d stack frames."%stack_length
+                            return
+                    else:
+                        is_exploitable=True
+
+                    if self.access_type == "exec":
+                        is_exploitable = True
+
+                    addr = self.exc_address
+                    max_offset = 1024
+
+                    if (addr > 0x55555555 - max_offset and addr < 0x55555555 + max_offset):
+                        print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
+                        print tty_colors.red()+"The access address indicates the use of freed memory if MallocScribble was used, or uninitialized memory if libgmalloc and MALLOC_FILL_SPACE was used."+tty_colors.default()
+                        reportexploitable="The access address indicates the use of freed memory if MallocScribble was used, or uninitialized memory if libgmalloc and MALLOC_FILL_SPACE was used."
+                    
+                    elif (addr > 0xaaaaaaaa - max_offset and addr < 0xaaaaaaaa + max_offset):
+                        print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()                        
+                        print tty_colors.red()+"The access address indicates that uninitialized memory was being used if MallocScribble was used."+tty_colors.default()
+                        reportexploitable="The access address indicates that uninitialized memory was being used if MallocScribble was used."                            
+
+                    elif "EXC_I386_GPFLT" == self.exc_code:
+                        print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
+                        print tty_colors.red()+"The exception code indicates that the access address was invalid in the 64-bit ABI (it was > 0x0000800000000000)."+tty_colors.default()
+                        reportexploitable="The exception code indicates that the access address was invalid in the 64-bit ABI (it was > 0x0000800000000000)."
+
+                    elif not g_ignore_frame_pointer  and bp_inconsistent_with_sp(self.bp,self.sp):
+                        is_exploitable = True
+                        print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
+                        print tty_colors.red()+"Presumed exploitable based on the discrepancy between the stack pointer and base pointer registers. "+tty_colors.default()
+                        reportexploitable="Presumed exploitable based on the discrepancy between the stack pointer and base pointer registers."
+
+                    else:
+                        print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
+
+                        if self.access_type=="read" or self.access_type=="write":
+                            print tty_colors.red()+"Crash "+self.access_type+"'g invalid address."+tty_colors.default()
+                            reportexploitable= "Crash "+self.access_type+"'g invalid address."
+                        else:
+                            print tty_colors.red()+"Crash accessing invalid address."+tty_colors.default()
+                            reportexploitable= "Crash accessing invalid address."
+
+            elif self.exception=="EXC_BAD_INSTRUCTION":
+                is_exploitable = True
+                print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
+                print tty_colors.blue()+"Illegal instruction at %s, probably a exploitable issue unless the crash was in libdispatch/xpc."%self.pc+tty_colors.default()
+                reportexploitable="Illegal instruction at %s, probably a exploitable issue unless the crash was in libdispatch/xpc."%self.pc
+
+            elif self.exception=="EXC_ARITHMETIC":
+                is_exploitable = False
+                print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
+                print tty_colors.blue()+"Arithmetic exception at %s, probably not exploitable."%self.pc+tty_colors.default()
+                reportexploitable="Arithmetic exception at %s, probably not exploitable."%self.pc
+
+            elif self.exception=="EXC_SOFTWARE":
+                is_exploitable=False
+                print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
+                print tty_colors.blue()+"Software exception, probably not exploitable."+tty_colors.default()
+                reportexploitable="Software exception, probably not exploitable."
+
+            elif self.exception=="EXC_BREAKPOINT":
+                is_exploitable=False
+                print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
+                print tty_colors.blue()+"Software breakpoint, probably not exploitable."+tty_colors.default()
+                reportexploitable="Software breakpoint, probably not exploitable."
+            
+            elif self.exc_address=="EXC_CRASH":
+                is_exploitable= False
+                print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
+
+        elif self.signal:
+            is_stack_suspicious(self.exc_address, self.exception, self.backtrace)
+        
+
+def exploitable(debugger,cmd,res,dict):
+    """checks if the crash is exploitable"""
+    lisa_=Lisa(debugger,res,dict)
+
+class ShellStorm:
+    def __init__(self):
+        pass
+
+    def searchShellcode(self, keyword):
+        try:
+            print "Connecting to shell-storm.org..."
+            s = httplib.HTTPConnection("shell-storm.org")
+            s.request("GET", "/api/?s="+str(keyword))
+            res = s.getresponse()
+            data_l = res.read().split('\n')
+        except:
+            print "Cannot connect to shell-storm.org"
+            return None
+
+        data_dl = []
+        for data in data_l:
+            try:
+                desc = data.split("::::")
+                try:
+                    dico = {
+                             'ScAuthor': desc[0],
+                             'ScArch': desc[1],
+                             'ScTitle': desc[2],
+                             'ScId': desc[3],
+                             'ScUrl': desc[4],
+                             'ScSize': int(''.join(x for x in desc[2][-10:-5] if x.isdigit()))
+                           }
+                except Exception:
+                    dico = {
+                             'ScAuthor': desc[0],
+                             'ScArch': desc[1],
+                             'ScTitle': desc[2],
+                             'ScId': desc[3],
+                             'ScUrl': desc[4],
+                             'ScSize': 0
+                           }
 
 
-#Vulnerbility Classfication
-#have to code
+                data_dl.append(dico)
+            except:
+                pass
 
-def alias(debugger,commands,result,dict):
-    banner()
-    execute(debugger,'command script add --function lisa.exploitable exploitable',result,dict)
-    execute(debugger,'command script add --function lisa.pattern_create pattern_create',result,dict)
-    execute(debugger,'command script add --function lisa.pattern_offset pattern_offset',result,dict)
-    execute(debugger,'command script add --function lisa.check_if_cyclic check_if_cyclic',result,dict)
-    execute(debugger,'command script add --function lisa.stepnInstructions sf',result,dict)
-    execute(debugger,'command script add --function lisa.context ct',result,dict)
-    execute(debugger,'command script add --function lisa.s s',result,dict)
-    execute(debugger,'command script add --function lisa.si si',result,dict)
-    execute(debugger,'command script add --function lisa.so so',result,dict)
+        try:
+            return sorted(data_dl, key=lambda x: x['ScSize'], reverse=True)
+        except Exception:
+            print("Could not sort by size")
+
+        return data_dl
+
+    def displayShellcode(self, shellcodeId):
+        if shellcodeId is None:
+            return None
+
+        try:
+            print "Connecting to shell-storm.org..."
+            s = httplib.HTTPConnection("shell-storm.org")
+        except:
+            print "Cannot connect to shell-storm.org"
+            return None
+
+        try:
+            s.request("GET", "/shellcode/files/shellcode-"+str(shellcodeId)+".php")
+            res = s.getresponse()
+            data = res.read().split("<pre>")[1].split("<body>")[0]
+        except:
+            print "Failed to download shellcode from shell-storm.org"
+            return None
+
+        data = data.replace("&quot;", "\"")
+        data = data.replace("&amp;", "&")
+        data = data.replace("&lt;", "<")
+        data = data.replace("&gt;", ">")
+
+        return data
+
+    @staticmethod
+    def version():
+        print "shell-storm API - v0.1"
+        print "Search and display all shellcodes in shell-storm database"
+        print "Jonathan Salwan - @JonathanSalwan - 2012"
+        print "http://shell-storm.org"
+        return
+
+def syntax():
+    print "Syntax:   shellcode <option> <arg>\n"
+    print "Options:  -search <keyword>"
+    print "          -display <shellcode id>"
+    print "          -save <shellcode id>"
+
+def shellcode(debugger, command, result, dict):
+    mod = shlex.split(command)
+    if len(mod)!=2:
+        syntax()
+        return
+
+    arg = mod[1]
+    mod = mod[0]
+    if mod != "-search" and mod != "-display" and mod != "-save":
+        syntax()
+        return
+
+    if mod == "-search":
+        api = ShellStorm()
+        res_dl = api.searchShellcode(arg)
+        if not res_dl:
+            print "Shellcode not found"
+            sys.exit(0)
+
+        print "Found %d shellcodes" % len(res_dl)
+        print "%s\t%s %s" %("ScId", "Size", "Title")
+        for data_d in res_dl:
+            if data_d['ScSize'] == 0:
+                print "[%s]\tn/a  %s - %s"%(data_d['ScId'], data_d['ScArch'], data_d['ScTitle'])
+            else:
+                print "[%s]\t%s%s - %s"%(data_d['ScId'], str(data_d['ScSize']).ljust(5), data_d['ScArch'], data_d['ScTitle'])
+
+    elif mod == "-display":
+        res = ShellStorm().displayShellcode(arg)
+        if not res:
+            print "Shellcode id not found"
+            return
+        print tty_colors.red()+res+tty_colors.default()
+
+    elif mod == "-save":
+        res = ShellStorm().displayShellcode(arg)
+
+        if not res:
+            print "Shellcode id not found"
+            return
+        f=open('shellcode_'+str(time.time())+'.c','w')
+        f.write(res)
+        f.close()            
+        print tty_colors.red()+"Written to file shellcode_"+str(time.time())+'.c'+tty_colors.default()
+
+def __lldb_init_module(debugger, dict):
+    
+    debugger.HandleCommand('command script add --function lisa.exploitable exploitable')
+    debugger.HandleCommand('command script add --function lisa.pattern_create pattern_create')
+    debugger.HandleCommand('command script add --function lisa.pattern_offset pattern_offset')
+    debugger.HandleCommand('command script add --function lisa.check_if_cyclic check_if_cyclic')
+    debugger.HandleCommand('command script add --function lisa.stepnInstructions sf')
+    debugger.HandleCommand('command script add --function lisa.context ct')
+    debugger.HandleCommand('command script add --function lisa.s s')
+    debugger.HandleCommand('command script add --function lisa.si si')
+    debugger.HandleCommand('command script add --function lisa.so so')
+    debugger.HandleCommand('command script add --function lisa.banner banner')
+    debugger.HandleCommand('command script add --function lisa.exploitable exploitable')
+    debugger.HandleCommand('command script add -function lisa.setMallocDebug setmalloc')
+    debugger.HandleCommand('command script add -function lisa.shellcode shellcode')
+
 tty_colors = TerminalColors (True)
