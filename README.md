@@ -1,9 +1,6 @@
 # lisa.py
 -An Exploit Dev Swiss Army Knife. 
 
-![alt tag](https://raw.githubusercontent.com/ant4g0nist/lisa.py/master/lisa.png)
-
-
 #Installation
 Copy lisa.py and .lldbinit to ~/ 
 Use the following commands:
