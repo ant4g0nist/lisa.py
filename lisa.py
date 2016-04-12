@@ -14,6 +14,8 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
+# from __future__ import print_function  # uncommon to get ready for Python 3
+
 import os
 import re
 import cmd
@@ -30,7 +32,6 @@ import argparse
 import platform
 import httplib
 from struct import *
-from sys import version_info
 from struct import pack
 from binascii   import *
 from ctypes import *
@@ -50,8 +51,10 @@ except:
 
 PYROPGADGET_VERSION = 'ich'
 
-if sys.version_info.major == 3:
-    xrange = range
+try:
+    xrange          # Python 2
+except NameError:
+    xrange = range  # Python 3
 
 import lldb
 
@@ -64,11 +67,10 @@ reportexploitable=""
 ###################
 
 REGISTERS = {
-    8 : ["al", "ah", "bl", "bh", "cl", "ch", "dl", "dh"],
-    16: ["ax", "bx", "cx", "dx"],
-    32: ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip"],
-    64: ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "rip",
-         "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+    8 : "al ah bl bh cl ch dl dh".split(),
+    16: "ax bx cx dx".split(),
+    32: "eax ebx ecx edx esi edi ebp esp eip".split(),
+    64: "rax rbx rcx rdx rsi rdi rbp rsp rip r8 r9 r10 r11 r12 r13 r14 r15".split()
 }
 
 ####################################
@@ -119,9 +121,9 @@ def urandom(debugger,n,result,dict):
         Generates random hex of given length
     """
     if not n:
-        print 'rand command an argument: example: rand 23'
+        print('rand command an argument: example: rand 23')
         return
-    print open('/dev/urandom','r').read(random.randint(int(n)/2,int(n)/2)).encode('hex')
+    print(open('/dev/urandom','r').read(random.randint(int(n)/2,int(n)/2)).encode('hex'))
 
 # run os commands
 def shell(debugger,command,result,dict):
@@ -155,10 +157,7 @@ class TerminalColors:
     def bold(self, on = True):
         '''Enable or disable bold depending on the "on" parameter.'''
         if self.enabled:
-            if on:
-                return "\x1b[1m";
-            else:
-                return "\x1b[22m";
+            return "\x1b[1m" if on else "\x1b[22m"
         return ''
     
     def italics(self, on = True):
