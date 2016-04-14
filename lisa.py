@@ -14,6 +14,8 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
+from __future__ import print_function
+
 import os
 import re
 import cmd
@@ -23,39 +25,43 @@ import shlex
 import random
 import string
 import struct
-import commands
+import commands  # does not exist in Python 3
 import datetime
 import optparse
 import argparse
 import platform
-import httplib
 from struct import *
-from sys import version_info
 from struct import pack
-from binascii   import *
+from binascii import *
 from ctypes import *
 import subprocess
 
+try:
+    import httplib      # Python 2
+except ImportError:
+    import http.client  # Python 3
 
-#install package
+# install package
 def install(name):
-    subprocess.call(['sudo','pip', 'install', name])    
+    subprocess.call(['sudo', 'pip', 'install', name])    
 
 try:
     from capstone import *
 except:
-    print "[+]\tGonna try installing capstone."
+    print("[+]\tGonna try installing capstone.")
     install('capstone')
     from capstone import *
 
 PYROPGADGET_VERSION = 'ich'
 
-if sys.version_info.major == 3:
-    xrange = range
+try:
+    xrange          # Python 2
+except NameError:
+    xrange = range  # Python 3
 
 import lldb
 
-#global vars#
+# global vars #
 lisaversion = 'v-ni'
 PAGE_SIZE=4096
 MAX_DISTANCE=PAGE_SIZE*10
@@ -64,11 +70,10 @@ reportexploitable=""
 ###################
 
 REGISTERS = {
-    8 : ["al", "ah", "bl", "bh", "cl", "ch", "dl", "dh"],
-    16: ["ax", "bx", "cx", "dx"],
-    32: ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip"],
-    64: ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "rip",
-         "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+    8 : "al ah bl bh cl ch dl dh".split(),
+    16: "ax bx cx dx".split(),
+    32: "eax ebx ecx edx esi edi ebp esp eip".split(),
+    64: "rax rbx rcx rdx rsi rdi rbp rsp rip r8 r9 r10 r11 r12 r13 r14 r15".split()
 }
 
 ####################################
@@ -95,33 +100,33 @@ def banner(debugger,command,result,dict):
         l::::::li::::::i s:::::::::::ss   a::::::::::aa:::a
         lllllllliiiiiiii  sssssssssss      aaaaaaaaaa  aaaa
         """
-    print tty_colors.green()+random.choice([lisa2])+tty_colors.default()
-    print tty_colors.red()+"\t-An Exploit Dev Swiss Army Knife. Version: "+lisaversion+tty_colors.default()
+    print(tty_colors.green()+random.choice([lisa2])+tty_colors.default())
+    print(tty_colors.red()+"\t-An Exploit Dev Swiss Army Knife. Version: "+lisaversion+tty_colors.default())
 
-#convert to hex
+# convert to hex
 def to_hex(var):
     """
         converts given value to hex
     """
     return hex(var)
 
-#hextoascii
+# hextoascii
 def hex2ascii(debugger,hex,result,dict):
     """
         converts Hex to ascii
         ex: h2a 0x41414141 prints AAAA
     """
-    print hex.replace('0x','').decode('hex')
+    print(hex.replace('0x','').decode('hex'))
 
-#generate random hex of length between n - m
+# generate random hex of length between n - m
 def urandom(debugger,n,result,dict):
     """
         Generates random hex of given length
     """
     if not n:
-        print 'rand command an argument: example: rand 23'
+        print('rand command an argument: example: rand 23')
         return
-    print open('/dev/urandom','r').read(random.randint(int(n)/2,int(n)/2)).encode('hex')
+    print(open('/dev/urandom','r').read(random.randint(int(n)/2,int(n)/2)).encode('hex'))
 
 # run os commands
 def shell(debugger,command,result,dict):
@@ -132,16 +137,17 @@ def shell(debugger,command,result,dict):
         if command:
             os.system(command)
         else:
-            print 'Please enter a proper shell command.Eg: shell ls'
+            print('Please enter a proper shell command.Eg: shell ls')
             return
     except:
-        print 'Please enter a proper shell command.Eg: shell ls'
+        print('Please enter a proper shell command.Eg: shell ls')
     return
 
-#term colors
+
+# term colors
 class TerminalColors:
     '''Simple terminal colors class'''
-    def __init__(self, enabled = True):
+    def __init__(self, enabled=True):
         # TODO: discover terminal type from "file" and disable if
         # it can't handle the color codes
         self.enabled = enabled
@@ -149,169 +155,127 @@ class TerminalColors:
     def reset(self):
         '''Reset all terminal colors and formatting.'''
         if self.enabled:
-            return "\x1b[0m";
+            return "\x1b[0m"
         return ''
     
-    def bold(self, on = True):
+    def bold(self, on=True):
         '''Enable or disable bold depending on the "on" parameter.'''
         if self.enabled:
-            if on:
-                return "\x1b[1m";
-            else:
-                return "\x1b[22m";
+            return "\x1b[1m" if on else "\x1b[22m"
         return ''
     
-    def italics(self, on = True):
+    def italics(self, on=True):
         '''Enable or disable italics depending on the "on" parameter.'''
         if self.enabled:
-            if on:
-                return "\x1b[3m";
-            else:
-                return "\x1b[23m";
+            return "\x1b[3m" if on else "\x1b[23m"
         return ''
     
-    def underline(self, on = True):
+    def underline(self, on=True):
         '''Enable or disable underline depending on the "on" parameter.'''
         if self.enabled:
-            if on:
-                return "\x1b[4m";
-            else:
-                return "\x1b[24m";
+            return "\x1b[4m" if on else "\x1b[24m"
         return ''
     
-    def inverse(self, on = True):
+    def inverse(self, on=True):
         '''Enable or disable inverse depending on the "on" parameter.'''
         if self.enabled:
-            if on:
-                return "\x1b[7m";
-            else:
-                return "\x1b[27m";
+            return "\x1b[7m" if on else "\x1b[27m"
         return ''
     
-    def strike(self, on = True):
+    def strike(self, on=True):
         '''Enable or disable strike through depending on the "on" parameter.'''
         if self.enabled:
-            if on:
-                return "\x1b[9m";
-            else:
-                return "\x1b[29m";
+            return "\x1b[9m" if on else "\x1b[29m"
         return ''
 
-    def black(self, fg = True):
+    def black(self, fg=True):
         '''Set the foreground or background color to black.
             The foreground color will be set if "fg" tests True. The background color will be set if "fg" tests False.'''
         if self.enabled:
-            if fg:
-                return "\x1b[30m";
-            else:
-                return "\x1b[40m";
+            return "\x1b[30m" if fg else "\x1b[40m"
         return ''
 
-    def red(self, fg = True):
+    def red(self, fg=True):
         '''Set the foreground or background color to red.
             The foreground color will be set if "fg" tests True. The background color will be set if "fg" tests False.'''
         if self.enabled:
-            if fg:
-                return "\x1b[31m";
-            else:
-                return "\x1b[41m";
+            return "\x1b[31m" if fg else "\x1b[41m"
         return ''
     
-    def green(self, fg = True):
+    def green(self, fg=True):
         '''Set the foreground or background color to green.
             The foreground color will be set if "fg" tests True. The background color will be set if "fg" tests False.'''
         if self.enabled:
-            if fg:
-                return "\x1b[32m";
-            else:
-                return "\x1b[42m";
+            return "\x1b[32m" if fg else "\x1b[42m"
         return ''
     
-    def yellow(self, fg = True):
+    def yellow(self, fg=True):
         '''Set the foreground or background color to yellow.
             The foreground color will be set if "fg" tests True. The background color will be set if "fg" tests False.'''
         if self.enabled:
-            if fg:
-                return "\x1b[43m";
-            else:
-                return "\x1b[33m";
+            return "\x1b[43m" if fg else "\x1b[33m"
         return ''
     
-    def blue(self, fg = True):
+    def blue(self, fg=True):
         '''Set the foreground or background color to blue.
             The foreground color will be set if "fg" tests True. The background color will be set if "fg" tests False.'''
         if self.enabled:
-            if fg:
-                return "\x1b[34m";
-            else:
-                return "\x1b[44m";
+            return "\x1b[34m" if fg else "\x1b[44m"
         return ''
     
-    def magenta(self, fg = True):
+    def magenta(self, fg=True):
         '''Set the foreground or background color to magenta.
             The foreground color will be set if "fg" tests True. The background color will be set if "fg" tests False.'''
         if self.enabled:
-            if fg:
-                return "\x1b[35m";
-            else:
-                return "\x1b[45m";
+            return "\x1b[35m" if fg else "\x1b[45m"
         return ''
     
-    def cyan(self, fg = True):
+    def cyan(self, fg=True):
         '''Set the foreground or background color to cyan.
             The foreground color will be set if "fg" tests True. The background color will be set if "fg" tests False.'''
         if self.enabled:
-            if fg:
-                return "\x1b[36m";
-            else:
-                return "\x1b[46m";
+            return "\x1b[36m" if fg else "\x1b[46m";
         return ''
     
-    def white(self, fg = True):
+    def white(self, fg=True):
         '''Set the foreground or background color to white.
             The foreground color will be set if "fg" tests True. The background color will be set if "fg" tests False.'''
         if self.enabled:
-            if fg:
-                return "\x1b[37m";
-            else:
-                return "\x1b[47m";
+            return "\x1b[37m" if fg else "\x1b[47m"
         return ''
     
-    def default(self, fg = True):
+    def default(self, fg=True):
         '''Set the foreground or background color to the default.
             The foreground color will be set if "fg" tests True. The background color will be set if "fg" tests False.'''
         if self.enabled:
-            if fg:
-                return "\x1b[39m";
-            else:
-                return "\x1b[49m";
+            return "\x1b[39m" if fg else "\x1b[49m"
         return ''
 
 ####################################
 #       LLDB                       #
 ####################################
 
-#set malloc debugging features
+# set malloc debugging features
 def setMallocDebug(debugger,c,result,dict):
     """sets DYLD_INSERT_LIBRARIES to /usr/lib/libgmalloc.dylib"""
     execute(debugger,'settings set target.env-vars DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib',result,dict)
     return True
 
-#execute given LLDB command
+# execute given LLDB command
 def execute(debugger,lldb_command,result,dict):
     """
         Execute given command and print the outout to stdout
     """
     debugger.HandleCommand(lldb_command)
 
-#execute command and return output
+# execute command and return output
 def executeReturnOutput(debugger,lldb_command,result,dict):
     """Execute given command and returns the outout"""
     ci = debugger.GetCommandInterpreter()
-    res=lldb.SBCommandReturnObject()
+    res = lldb.SBCommandReturnObject()
     ci.HandleCommand(lldb_command,res)
-    output= res.GetOutput()
-    error  = res.GetError()
+    output = res.GetOutput()
+    error = res.GetError()
     return (output,error)
 
 def s(debugger,command,result,dict):
@@ -352,7 +316,7 @@ def testjump(debugger,command,result,dict):
             return None
 
         if not inst:
-            pc =getregvalue(debugger,"pc",result,dict)
+            pc = getregvalue(debugger,"pc",result,dict)
 
             inst, error = executeReturnOutput(debugger,"x/1i $pc",result,dict)
             if not inst:
@@ -363,7 +327,6 @@ def testjump(debugger,command,result,dict):
         if opcode == "jmp":
             return (True,inst.split('  ')[4])
         if opcode == "je" and flags["ZF"]:
-            print inst.split('  ')[4]
             return (True,inst.split('  ')[4])
         if opcode == "jne" and not flags["ZF"]:
             return (True,inst.split('  ')[4])
@@ -400,19 +363,19 @@ def context(debugger,command,result,dict):
     try:
         #disas
         op, error=executeReturnOutput(debugger,"disassemble -c 2 -s $pc",result,dict)
-        print tty_colors.red()+"[*] Disassembly :\n"+tty_colors.default()
-        print op
+        print(tty_colors.red()+"[*] Disassembly :\n"+tty_colors.default())
+        print(op)
 
         #stack
         op, error=executeReturnOutput(debugger,"x/10x $sp",result,dict)
-        print tty_colors.red()+"[*] Stack :\n"+tty_colors.default()
-        print tty_colors.blue()+op+tty_colors.default()
+        print(tty_colors.red()+"[*] Stack :\n"+tty_colors.default())
+        print(tty_colors.blue()+op+tty_colors.default())
 
         #registers
         op, error=executeReturnOutput(debugger,"register read",result,dict)
-        print tty_colors.red()+"[*] Registers\t:"+tty_colors.default()
-        print op.split("\n\n")[0].split('General Purpose Registers:\n')[1].split('eflags')[0]
-        print '\n'
+        print(tty_colors.red()+"[*] Registers\t:"+tty_colors.default())
+        print(op.split("\n\n")[0].split('General Purpose Registers:\n')[1].split('eflags')[0])
+        print('\n')
 
         #jump
         dis, error=executeReturnOutput(debugger,'disassemble -c 1 -s $pc',result,dict)
@@ -422,14 +385,14 @@ def context(debugger,command,result,dict):
             if 'j' in dis:
                 jumpto, destination = testjump(debugger,command,result,dict)
                 if jumpto==True:
-                    print tty_colors.red()+"[*] Jumping to\t:"+destination+tty_colors.default()
+                    print(tty_colors.red()+"[*] Jumping to\t:"+destination+tty_colors.default())
                 else:
-                    print tty_colors.red()+"[*] Jump not taken."+tty_colors.default()
+                    print(tty_colors.red()+"[*] Jump not taken."+tty_colors.default())
         else:
-            print error,
+            print(error)
 
     except Exception as e:
-        print 'error running context'
+        print('error running context')
 
 def get_eflags(debugger,command,result,dict):
     """
@@ -440,33 +403,11 @@ def get_eflags(debugger,command,result,dict):
     """
 
     # Eflags bit masks, source vdb
-    EFLAGS_CF = 1 << 0
-    EFLAGS_PF = 1 << 2
-    EFLAGS_AF = 1 << 4
-    EFLAGS_ZF = 1 << 6
-    EFLAGS_SF = 1 << 7
-    EFLAGS_TF = 1 << 8
-    EFLAGS_IF = 1 << 9
-    EFLAGS_DF = 1 << 10
-    EFLAGS_OF = 1 << 11
-
-    flags = {"CF":0, "PF":0, "AF":0, "ZF":0, "SF":0, "TF":0, "IF":0, "DF":0, "OF":0}
-    eflags = getregvalue(debugger,"eflags",result,dict)
-
-    if not eflags:
-        eflags = getregvalue(debugger,"rflags",result,dict)
-    eflags=int(eflags,16)
-    flags["CF"] = bool(eflags & EFLAGS_CF)
-    flags["PF"] = bool(eflags & EFLAGS_PF)
-    flags["AF"] = bool(eflags & EFLAGS_AF)
-    flags["ZF"] = bool(eflags & EFLAGS_ZF)
-    flags["SF"] = bool(eflags & EFLAGS_SF)
-    flags["TF"] = bool(eflags & EFLAGS_TF)
-    flags["IF"] = bool(eflags & EFLAGS_IF)
-    flags["DF"] = bool(eflags & EFLAGS_DF)
-    flags["OF"] = bool(eflags & EFLAGS_OF)
-
-    return flags
+    eflags = (getregvalue(debugger,"eflags",result,dict) or
+              getregvalue(debugger,"rflags",result,dict))
+    eflags = int(eflags, 16)
+    masks = {"CF":0, "PF":2, "AF":4, "ZF":6, "SF":7, "TF":8, "IF":9, "DF":10, "OF":11}
+    return {key: bool(eflags & (1 << value)) for key, value in masks.items()}
 
 
 ####################################
@@ -478,13 +419,15 @@ def get_eflags(debugger,command,result,dict):
 def pattern_create(debugger,size,result,dict):
     """creates a cyclic pattern of given length"""
 
-    try:length=int(size)
-    except:print "[+] Usage: pattern_create <length> [set a] [set b] [set c]"
-    seta="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    setb="abcdefghijklmnopqrstuvwxyz"
-    setc="0123456789"
+    try:
+        length = int(size)
+    except:
+        print("[+] Usage: pattern_create <length> [set a] [set b] [set c]")
+    seta = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    setb = "abcdefghijklmnopqrstuvwxyz"
+    setc = "0123456789"
 
-    string="" ; a=0 ; b=0 ; c=0
+    string = "" ; a = b = c = 0
 
     while len(string) < length:
         string += seta[a] + setb[b] + setc[c]
@@ -493,7 +436,7 @@ def pattern_create(debugger,size,result,dict):
         if b == len(setb):b=0;a+=1
         if a == len(seta):a=0
     
-    print tty_colors.red()+ string[:length]+tty_colors.default()
+    print(tty_colors.red() + string[:length] + tty_colors.default())
 
     return string[:length]
 
@@ -501,12 +444,12 @@ def pattern_create(debugger,size,result,dict):
 def check_if_cyclic(debugger,pat,result,dict):
     """check if given pattern is in cyclic pattern"""
 
-    seta="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    setb="abcdefghijklmnopqrstuvwxyz"
-    setc="0123456789"
+    #seta="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    #setb="abcdefghijklmnopqrstuvwxyz"
+    #setc="0123456789"
     
     if not pat:
-        print '[+] Usage: check_if_cyclic <some string>'
+        print('[+] Usage: check_if_cyclic <some string>')
         return
 
     string=pat ; a=0 ; b=0 ; c=0
@@ -519,10 +462,10 @@ def check_if_cyclic(debugger,pat,result,dict):
                     if string[i+2].isdigit():
                         pass
                     else:
-                        print tty_colors.red()+"Not a cyclic pattern"+tty_colors.default()
+                        print(tty_colors.red()+"Not a cyclic pattern"+tty_colors.default())
                         return False
                 else:
-                    print tty_colors.red()+"Not a cyclic pattern"+tty_colors.default()
+                    print(tty_colors.red()+"Not a cyclic pattern"+tty_colors.default())
                     return False
         
             elif string[i].isupper():
@@ -530,10 +473,10 @@ def check_if_cyclic(debugger,pat,result,dict):
                     if string[i+2].isdigit():
                         pass
                     else:
-                            print tty_colors.red()+"Not a cyclic pattern"+tty_colors.default()
+                            print(tty_colors.red()+"Not a cyclic pattern"+tty_colors.default())
                             return False
                 else:
-                    print tty_colors.red()+"Not a cyclic pattern"+tty_colors.default()
+                    print(tty_colors.red()+"Not a cyclic pattern"+tty_colors.default())
                     return False
 
         elif string[i].isdigit():
@@ -542,15 +485,15 @@ def check_if_cyclic(debugger,pat,result,dict):
                     if string[i+2].islower():
                         pass
                     else:
-                        print tty_colors.red()+"Not a cyclic pattern"+tty_colors.default()
+                        print(tty_colors.red()+"Not a cyclic pattern"+tty_colors.default())
                         return False
                 else:
-                    print tty_colors.red()+"Not a cyclic pattern"+tty_colors.default()
+                    print(tty_colors.red()+"Not a cyclic pattern"+tty_colors.default())
                     return False
 
 
-        i+=3
-    print "seems to be a valid pattern"
+        i += 3
+    print("seems to be a valid pattern")
     return True
 
 #pattern search
@@ -572,10 +515,10 @@ def pattern_offset(debugger,sizepat,result,dict):
                 pass
             found=[m.start() for m in re.finditer(pat, pattern)]
             if found!=-1:
-                print 'offsets:',found
+                print('offsets:',found)
         except:
-            print "please check the syntax"
-            print "pattern_offset 250 Aa2A"
+            print("please check the syntax")
+            print("pattern_offset 250 Aa2A")
                 
     elif len(sizepat.split(' '))==1:
         try:
@@ -593,10 +536,10 @@ def pattern_offset(debugger,sizepat,result,dict):
             found=[m.start() for m in re.finditer(pat, pattern)]
             #                found=pattern.find(pat)
             if found!=-1:
-                print found
+                print(found)
         except:
-            print "please check the syntax"
-            print "pattern_offset 250 Aa2A"
+            print("please check the syntax")
+            print("pattern_offset 250 Aa2A")
 
 #return address in register
 def getregvalue(debugger,reg,result,dict):
@@ -636,17 +579,10 @@ def getsignal(signal_description):
 
 def type_for_two_memory(access_address, disassembly):
     first_reg_val = value_for_first_register(disassembly)
-    if first_reg_val != access_address:
-        return "read"
-    else:
-        return "write"
+    return "read" if first_reg_val != access_address else "write"
 
 def stack_access_crash(access_address, sp_val):
-    access_address=int(access_address,0)
-    sp_val = int(sp_val,0)
-    if ((sp_val - access_address) <= PAGE_SIZE):
-        return True
-    return False
+    return (int(sp_val, 0) - int(access_address, 0)) <= PAGE_SIZE
 
 def getexceptiontype(access_address, disassembly, registers):
     if disassembly!=None:
@@ -663,7 +599,6 @@ def getexceptiontype(access_address, disassembly, registers):
             if not right_paren or last_comma:
                 type_ = "recursion"
             elif stack_access_crash(access_address,sp):
-                print 'ohhh'
                 type_ = "recursion"
             else:
                 type_ = "exec"
@@ -735,38 +670,34 @@ def is_stack_suspicious(exc_address, exception, backtrace):
     global reportexploitable
     global is_exploitable
 
-    suspicious_functions = [
-            "__chk_fail", "__stack_chk_fail", "szone_error", "CFRelease", "CFRetain", "_CFRelease", "_CFRetain",
-           "malloc", "calloc", "realloc", "objc_msgSend",
-           "szone_free", "free_small", "tiny_free_list_add_ptr", "tiny_free_list_remove_ptr",
-           "small_free_list_add_ptr", "small_free_list_remove_ptr", "large_entries_free_no_lock",
-           "large_free_no_lock", "szone_batch_free", "szone_destroy", "free",
-           "CSMemDisposeHandle", "CSMemDisposePtr",
-           "append_int", "release_file_streams_for_task", "__guard_setup",
-           "_CFStringAppendFormatAndArgumentsAux", "WTF::fastFree", "WTF::fastMalloc",
-           "WTF::FastCalloc", "WTF::FastRealloc", " WTF::tryFastCalloc", "WTF::tryFastMalloc",
-           "WTF::tryFastRealloc", "WTF::TCMalloc_Central_FreeList", "GMfree", "GMmalloc_zone_free",
-           "GMrealloc", "GMmalloc_zone_realloc"]
+    suspicious_functions = """__chk_fail __stack_chk_fail szone_error CFRelease CFRetain
+        _CFRelease _CFRetain malloc calloc realloc objc_msgSend szone_free free_small
+        tiny_free_list_add_ptr tiny_free_list_remove_ptr small_free_list_add_ptr
+        small_free_list_remove_ptr large_entries_free_no_lock large_free_no_lock
+        szone_batch_free szone_destroy free CSMemDisposeHandle CSMemDisposePtr append_int
+        release_file_streams_for_task __guard_setup _CFStringAppendFormatAndArgumentsAux
+        WTF::fastFree WTF::fastMalloc WTF::FastCalloc WTF::FastRealloc WTF::tryFastCalloc
+        WTF::tryFastMalloc WTF::tryFastRealloc WTF::TCMalloc_Central_FreeList GMfree
+        GMmalloc_zone_free GMrealloc GMmalloc_zone_realloc""".split()
 
     if exc_address=="0xbbadbeef":
         # WebCore functions call CRASH() in various assertions or if the amount to allocate was too big. CRASH writes a null byte to 0xbbadbeef.
         is_exploitable=False
-        print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()        
+        print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
         reportexploitable = "Not exploitable. Seems to be a safe crash. Calls to CRASH() function writes a null byte to 0xbbadbeef"
-        print tty_colors.red()+"Not exploitable. Seems to be a safe crash. Calls to CRASH() function writes a null byte to 0xbbadbeef"+tty_colors.default()
-
+        print(tty_colors.red() + reportexploitable + tty_colors.default())
         return 
 
     if "0   ???" in backtrace:
         is_exploitable = True
-        print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
-        print tty_colors.red()+"This crash is suspected to be exploitable because the crashing instruction is outside of a known function, i.e. in dynamically generated code"+tty_colors.default()
+        print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
         reportexploitable="This crash is suspected to be exploitable because the crashing instruction is outside of a known function, i.e. in dynamically generated code"
+        print(tty_colors.red() + reportexploitable + tty_colors.default())
         return
 
     for i in suspicious_functions:
         if i in backtrace:
-            if exception == "EXC_BREAKPOINT" and (i=="CFRelease" or i=="CFRetain"):
+            if exception == "EXC_BREAKPOINT" and i in ("CFRelease", "CFRetain"):
                 is_exploitable = "no"
                 return
             elif i=="_CFRelease" or i=="CFRelease" and "CGContextDelegateFinalize" in backtrace:
@@ -775,9 +706,9 @@ def is_stack_suspicious(exc_address, exception, backtrace):
                 continue
             else:
                 is_exploitable = True
-                print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
-                print tty_colors.red()+"The crash is suspected to be an exploitable issue due to the suspicious function in the stack trace of the crashing thread: "+i+tty_colors.default()
+                print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
                 reportexploitable="The crash is suspected to be an exploitable issue due to the suspicious function in the stack trace of the crashing thread."
+                print(tty_colors.red() + reportexploitable + tty_colors.default())
                 return
 
 #return whether or not the base pointer is far away from the stack pointer.
@@ -785,9 +716,7 @@ def bp_inconsistent_with_sp(bp_val,sp_val):
     #define MAX_DISTANCE (PAGE_SIZE * 10)
     #    No check if bp_val > sp_val since bp_val - sp_val may have underflowed.
 
-    if (int(bp_val,0) - int(sp_val,0)) > MAX_DISTANCE:
-        return True
-    return False
+    return int(bp_val, 0) - int(sp_val, 0) > MAX_DISTANCE
 
 class Lisa:
     def __init__(self, debugger,result,dict):
@@ -802,22 +731,16 @@ class Lisa:
         self.bp = hex(self.frame.fp)
 
         disas,disas_error = executeReturnOutput(debugger,"disassemble -c 1 -s $pc",result,dict)
-
-        if disas_error:
-            self.pc_disas = None
-        else:
-            self.pc_disas = re.search("->(.+?)\n",disas).group().split(':')[1]
-
+        self.pc_disas = None if disas_error else re.search("->(.+?)\n",disas).group().split(':')[1]
         self.backtrace, self.backtrace_error = executeReturnOutput(debugger,"bt",result,dict)
-
-        self.crash_reason = self.thread.GetStopReason()
         
+        self.crash_reason = self.thread.GetStopReason()
         if self.crash_reason == lldb_stop_reasons['eStopReasonException']:
             self.exception = self.thread.GetStopDescription(80)
             self.exception,self.exc_code,self.exc_address = getexception(self.exception)
             self.signal = None
 
-            print tty_colors.red()+"Exception : "+self.exception+tty_colors.default()
+            print(tty_colors.red()+"Exception : "+self.exception+tty_colors.default())
 
         elif self.crash_reason == lldb_stop_reasons['eStopReasonSignal']:
             self.signal = self.thread.GetStopDescription(80)
@@ -825,16 +748,13 @@ class Lisa:
             self.exc_address = None
             self.exception = None
 
-            print tty_colors.red()+"Signal : "+self.signal+tty_colors.default()
+            print(tty_colors.red()+"Signal : "+self.signal+tty_colors.default())
             
         else:
             return
 
         self.gen_registers =  list(self.frame.registers)[0]
-        self.registers = {}
-
-        for i in  self.gen_registers.__iter__():
-            self.registers[i.name]=i.value
+        self.registers = {i.name: i.value for i in self.gen_registers.__iter__()}
 
         max_offset = 1024
         if self.exception:
@@ -844,18 +764,17 @@ class Lisa:
                 if self.exc_address and int(self.exc_address,0)==int(self.pc,0):
                     # IP over write
                     is_exploitable = True
-                    print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
-                    print tty_colors.red()+"Trying to execute a bad address, this is a potentially exploitable issue"+tty_colors.default()
+                    print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
                     reportexploitable="Trying to execute a bad address, this is a potentially exploitable issue"
-
+                    print(tty_colors.red() + reportexploitable + tty_colors.default())
                 else:
                     self.access_type = getexceptiontype(self.exc_address, self.pc_disas, self.registers)
                     
                     if self.exc_address and int(self.exc_address,16)<int(PAGE_SIZE):
                         is_exploitable=False
-                        print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
-                        print tty_colors.blue()+"Null Dereference. Probably not exploitable"+tty_colors.default()
+                        print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
                         reportexploitable="Null Dereference. Probably not exploitable"
+                        print(tty_colors.blue() + reportexploitable + tty_colors.default())
                         return
 
                     elif self.access_type == "recursion":
@@ -866,9 +785,9 @@ class Lisa:
                         stack_length= len(stack.split("\n"))
 
                         if stack_length>MINIMUM_RECURSION_LENGTH:
-                            print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
-                            print tty_colors.red()+"The crash is suspected to be not exploitable due to unbounded recursion since there were %d stack frames."%stack_length+tty_colors.default()
+                            print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
                             reportexploitable="The crash is suspected to be not exploitable due to unbounded recursion since there were %d stack frames."%stack_length
+                            print(tty_colors.blue() + reportexploitable + tty_colors.default())
                             return
                     else:
                         is_exploitable=True
@@ -880,63 +799,61 @@ class Lisa:
                     max_offset = 1024
 
                     if (addr > 0x55555555 - max_offset and addr < 0x55555555 + max_offset):
-                        print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
-                        print tty_colors.red()+"The access address indicates the use of freed memory if MallocScribble was used, or uninitialized memory if libgmalloc and MALLOC_FILL_SPACE was used."+tty_colors.default()
+                        print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
                         reportexploitable="The access address indicates the use of freed memory if MallocScribble was used, or uninitialized memory if libgmalloc and MALLOC_FILL_SPACE was used."
+                        print(tty_colors.red() + reportexploitable + tty_colors.default())
                     
                     elif (addr > 0xaaaaaaaa - max_offset and addr < 0xaaaaaaaa + max_offset):
-                        print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()                        
-                        print tty_colors.red()+"The access address indicates that uninitialized memory was being used if MallocScribble was used."+tty_colors.default()
-                        reportexploitable="The access address indicates that uninitialized memory was being used if MallocScribble was used."                            
+                        print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())                
+                        reportexploitable="The access address indicates that uninitialized memory was being used if MallocScribble was used."
+                        print(tty_colors.red() + reportexploitable + tty_colors.default())
 
                     elif "EXC_I386_GPFLT" == self.exc_code:
-                        print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
-                        print tty_colors.red()+"The exception code indicates that the access address was invalid in the 64-bit ABI (it was > 0x0000800000000000)."+tty_colors.default()
+                        print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
                         reportexploitable="The exception code indicates that the access address was invalid in the 64-bit ABI (it was > 0x0000800000000000)."
+                        print(tty_colors.red() + reportexploitable + tty_colors.default())
 
-                    elif not g_ignore_frame_pointer  and bp_inconsistent_with_sp(self.bp,self.sp):
+                    elif not g_ignore_frame_pointer and bp_inconsistent_with_sp(self.bp,self.sp):
                         is_exploitable = True
-                        print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
-                        print tty_colors.red()+"Presumed exploitable based on the discrepancy between the stack pointer and base pointer registers. "+tty_colors.default()
+                        print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
                         reportexploitable="Presumed exploitable based on the discrepancy between the stack pointer and base pointer registers."
-
+                        print(tty_colors.red() + reportexploitable + tty_colors.default())
                     else:
-                        print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
+                        print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
 
-                        if self.access_type=="read" or self.access_type=="write":
-                            print tty_colors.red()+"Crash "+self.access_type+"'g invalid address."+tty_colors.default()
-                            reportexploitable= "Crash "+self.access_type+"'g invalid address."
+                        if self.access_type in ("read", "write"):
+                            reportexploitable = "Crash "+self.access_type+"'g invalid address."
                         else:
-                            print tty_colors.red()+"Crash accessing invalid address."+tty_colors.default()
-                            reportexploitable= "Crash accessing invalid address."
+                            reportexploitable = "Crash accessing invalid address."
+                        print(tty_colors.red() + reportexploitable + tty_colors.default())
 
             elif self.exception=="EXC_BAD_INSTRUCTION":
                 is_exploitable = True
-                print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
-                print tty_colors.blue()+"Illegal instruction at %s, probably a exploitable issue unless the crash was in libdispatch/xpc."%self.pc+tty_colors.default()
+                print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
                 reportexploitable="Illegal instruction at %s, probably a exploitable issue unless the crash was in libdispatch/xpc."%self.pc
+                print(tty_colors.blue() + reportexploitable + tty_colors.default())
 
             elif self.exception=="EXC_ARITHMETIC":
                 is_exploitable = False
-                print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
-                print tty_colors.blue()+"Arithmetic exception at %s, probably not exploitable."%self.pc+tty_colors.default()
+                print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
                 reportexploitable="Arithmetic exception at %s, probably not exploitable."%self.pc
+                print(tty_colors.blue() + reportexploitable + tty_colors.default())
 
             elif self.exception=="EXC_SOFTWARE":
                 is_exploitable=False
-                print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
-                print tty_colors.blue()+"Software exception, probably not exploitable."+tty_colors.default()
+                print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
                 reportexploitable="Software exception, probably not exploitable."
+                print(tty_colors.blue() + reportexploitable + tty_colors.default())
 
             elif self.exception=="EXC_BREAKPOINT":
                 is_exploitable=False
-                print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
-                print tty_colors.blue()+"Software breakpoint, probably not exploitable."+tty_colors.default()
+                print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
                 reportexploitable="Software breakpoint, probably not exploitable."
+                print(tty_colors.blue() + reportexploitable + tty_colors.default())
             
             elif self.exc_address=="EXC_CRASH":
                 is_exploitable= False
-                print tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default()
+                print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
 
         elif self.signal:
             is_stack_suspicious(self.exc_address, self.exception, self.backtrace)
@@ -952,13 +869,13 @@ class ShellStorm:
 
     def searchShellcode(self, keyword):
         try:
-            print "Connecting to shell-storm.org..."
+            print("Connecting to shell-storm.org...")
             s = httplib.HTTPConnection("shell-storm.org")
             s.request("GET", "/api/?s="+str(keyword))
             res = s.getresponse()
             data_l = res.read().split('\n')
         except:
-            print "Cannot connect to shell-storm.org"
+            print("Cannot connect to shell-storm.org")
             return None
 
         data_dl = []
@@ -1001,10 +918,10 @@ class ShellStorm:
             return None
 
         try:
-            print "Connecting to shell-storm.org..."
+            print("Connecting to shell-storm.org...")
             s = httplib.HTTPConnection("shell-storm.org")
         except:
-            print "Cannot connect to shell-storm.org"
+            print("Cannot connect to shell-storm.org")
             return None
 
         try:
@@ -1012,7 +929,7 @@ class ShellStorm:
             res = s.getresponse()
             data = res.read().split("<pre>")[1].split("<body>")[0]
         except:
-            print "Failed to download shellcode from shell-storm.org"
+            print("Failed to download shellcode from shell-storm.org")
             return None
 
         data = data.replace("&quot;", "\"")
@@ -1024,10 +941,10 @@ class ShellStorm:
 
     @staticmethod
     def version():
-        print "shell-storm API - v0.1"
-        print "Search and display all shellcodes in shell-storm database"
-        print "Jonathan Salwan - @JonathanSalwan - 2012"
-        print "http://shell-storm.org"
+        print("shell-storm API - v0.1")
+        print("Search and display all shellcodes in shell-storm database")
+        print("Jonathan Salwan - @JonathanSalwan - 2012")
+        print("http://shell-storm.org")
         return
 
 def extract_from_universal_binary(debugger,command,result,dict):
@@ -1038,13 +955,10 @@ def extract_from_universal_binary(debugger,command,result,dict):
     """
     args = shlex.split(command)
     if len(args)==3:
-        architecture = args[0]
-        intputfile = args[1]
-        outputfile = args[2]
-
+        architecture, intputfile, outputfile = args
         commands.getoutput('lipo '+intputfile+' -extract '+architecture+' -output '+outputfile)
     else:
-        print "Syntax: extract x86_64 /usr/lib/system/libsystem_kernel.dylib ./libsystem_kernel.dylib"
+        print("Syntax: extract x86_64 /usr/lib/system/libsystem_kernel.dylib ./libsystem_kernel.dylib")
 
 
 
@@ -1053,15 +967,14 @@ def shellcode(debugger, command, result, dict):
        Syntax:shellcode"""
     mod = shlex.split(command)
     if len(mod)!=2:
-        print "Syntax:   shellcode <option> <arg>\n"
-        print "Options:  -search <keyword>"
-        print "          -display <shellcode id>"
-        print "          -save <shellcode id>"
+        print("Syntax:   shellcode <option> <arg>\n")
+        print("Options:  -search <keyword>")
+        print("          -display <shellcode id>")
+        print("          -save <shellcode id>")
         return
 
-    arg = mod[1]
-    mod = mod[0]
-    if mod != "-search" and mod != "-display" and mod != "-save":
+    mod, arg = mod
+    if mod not in ("-search", "-display", "-save"):
         syntax()
         return
 
@@ -1069,34 +982,34 @@ def shellcode(debugger, command, result, dict):
         api = ShellStorm()
         res_dl = api.searchShellcode(arg)
         if not res_dl:
-            print "Shellcode not found"
+            print("Shellcode not found")
             sys.exit(0)
 
-        print "Found %d shellcodes" % len(res_dl)
-        print "%s\t%s %s" %("ScId", "Size", "Title")
+        print("Found %d shellcodes" % len(res_dl))
+        print("%s\t%s %s" %("ScId", "Size", "Title"))
         for data_d in res_dl:
             if data_d['ScSize'] == 0:
-                print "[%s]\tn/a  %s - %s"%(data_d['ScId'], data_d['ScArch'], data_d['ScTitle'])
+                print("[%s]\tn/a  %s - %s"%(data_d['ScId'], data_d['ScArch'], data_d['ScTitle']))
             else:
-                print "[%s]\t%s%s - %s"%(data_d['ScId'], str(data_d['ScSize']).ljust(5), data_d['ScArch'], data_d['ScTitle'])
+                print("[%s]\t%s%s - %s"%(data_d['ScId'], str(data_d['ScSize']).ljust(5), data_d['ScArch'], data_d['ScTitle']))
 
     elif mod == "-display":
         res = ShellStorm().displayShellcode(arg)
         if not res:
-            print "Shellcode id not found"
+            print("Shellcode id not found")
             return
-        print tty_colors.red()+res+tty_colors.default()
+        print(tty_colors.red()+res+tty_colors.default())
 
     elif mod == "-save":
         res = ShellStorm().displayShellcode(arg)
 
         if not res:
-            print "Shellcode id not found"
+            print("Shellcode id not found")
             return
-        f=open('shellcode_'+str(time.time())+'.c','w')
-        f.write(res)
-        f.close()            
-        print tty_colors.red()+"Written to file shellcode_"+str(time.time())+'.c'+tty_colors.default()
+        filename = 'shellcode_'+str(time.time())+'.c'
+        with open(filename,'w') as f:
+            f.write(res)    
+        print(tty_colors.red()+"Written to file shellcode_"+filename+'.c'+tty_colors.default())
 
     
 
@@ -1108,29 +1021,24 @@ def dump(debugger,command,result,dict):
 
     args = shlex.split(command)
     if len(args)<3:
-        print "Syntax: dump outfile 0x6080000fe680 0x6080000fe680+1000"
+        print("Syntax: dump outfile 0x6080000fe680 0x6080000fe680+1000")
         return
 
-    outfile = args[0]
-    start_range = args[1]
-    end_range = args[2]
-    force=False
-    if len(args)>3:
-        force=True
-
+    outfile, start_range, end_range = args[:3]
+    force = len(args) > 3
     if force:
         output,error=executeReturnOutput(debugger,"memory read -b --force --outfile "+outfile+' '+start_range+' '+end_range,result,dict)    
     else:
         output,error=executeReturnOutput(debugger,"memory read -b --outfile "+outfile+' '+start_range+' '+end_range,result,dict)
 
     if not error:
-        print output,
+        print(output)
     else:
         if "--force" in error:
-            print "dump will not read over 1024 bytes of data. To overwride this use -f."
-            print "Syntax: dump outfile 0x6080000fe680 0x6080000fe680+1000 -f"
+            print("dump will not read over 1024 bytes of data. To overwride this use -f.")
+            print("Syntax: dump outfile 0x6080000fe680 0x6080000fe680+1000 -f")
         else:
-            print error
+            print(error)
 
 class MACH_HEADER(Structure):
     _fields_ = [
@@ -1438,7 +1346,6 @@ def deleteDuplicateGadgets(currentGadgets):
 
 def alphaSortgadgets(currentGadgets):
     return sorted(currentGadgets, key=lambda key : key["gadget"]) 
-
 
 
 class Options:
@@ -2920,7 +2827,7 @@ def rop(debugger,args,result,dict):
     if args:
         Core(Args(arguments=args).getArgs()).analyze()
     else:
-        print """description:
+        print("""description:
   rop(ROPgadget) lets you search your gadgets on a binary. It supports several 
   file formats and architectures and uses the Capstone disassembler for
   the search engine.
@@ -2958,7 +2865,7 @@ architectures supported:
   rop --binary ./test-suite-binaries/Linux_lib64.so --offset 0xdeadbeef00000000
   rop --binary ./test-suite-binaries/elf-ARMv7-ls --depth 5
   rop --binary ./test-suite-binaries/elf-ARM64-bash --depth 5
-  rop --binary ./test-suite-binaries/raw-x86.raw --rawArch=x86 --rawMode=32"""
+  rop --binary ./test-suite-binaries/raw-x86.raw --rawArch=x86 --rawMode=32""")
 
 def __lldb_init_module(debugger, dict):
     
