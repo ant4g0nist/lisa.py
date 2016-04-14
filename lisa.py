@@ -25,7 +25,6 @@ import shlex
 import random
 import string
 import struct
-import commands  # does not exist in Python 3
 import datetime
 import optparse
 import argparse
@@ -956,7 +955,7 @@ def extract_from_universal_binary(debugger,command,result,dict):
     args = shlex.split(command)
     if len(args)==3:
         architecture, intputfile, outputfile = args
-        commands.getoutput('lipo '+intputfile+' -extract '+architecture+' -output '+outputfile)
+        subprocess.call(['lipo', intputfile, '-extract', architecture, '-output', outputfile])
     else:
         print("Syntax: extract x86_64 /usr/lib/system/libsystem_kernel.dylib ./libsystem_kernel.dylib")
 
