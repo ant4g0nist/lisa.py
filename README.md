@@ -377,6 +377,8 @@ Thanks:
 	- Phillips : https://www.phillips321.co.uk/2013/04/02/recreating-pattern_create-rb-in-python/
 
 	- Jonathan Salwan : http://shell-storm.org/shellcode/
+	
+	- Capstone : http://www.capstone-engine.org
 
 TODO:
 	add support for macho in ropmaker
