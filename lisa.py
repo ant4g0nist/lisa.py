@@ -20,38 +20,25 @@ import os
 import re
 import cmd
 import sys
+import glob
 import time
 import shlex
 import random
 import string
 import struct
+import thread
+import fnmatch
 import datetime
 import optparse
 import argparse
 import platform
+import requests
+import subprocess
 from struct import *
 from struct import pack
 from binascii import *
 from ctypes import *
-import subprocess
-
-try:
-    import httplib      # Python 2
-except ImportError:
-    import http.client  # Python 3
-
-# install package
-def install(name):
-    subprocess.call(['sudo', 'pip', 'install', name])    
-
-try:
-    from capstone import *
-except:
-    print("[+]\tGonna try installing capstone.")
-    install('capstone')
-    from capstone import *
-
-PYROPGADGET_VERSION = 'ich'
+from capstone import *
 
 try:
     xrange          # Python 2
@@ -60,24 +47,18 @@ except NameError:
 
 import lldb
 
-# global vars #
-lisaversion = 'v-ni'
-PAGE_SIZE=4096
-MAX_DISTANCE=PAGE_SIZE*10
-g_ignore_frame_pointer= False
-reportexploitable=""
 ###################
-
-REGISTERS = {
-    8 : "al ah bl bh cl ch dl dh".split(),
-    16: "ax bx cx dx".split(),
-    32: "eax ebx ecx edx esi edi ebp esp eip".split(),
-    64: "rax rbx rcx rdx rsi rdi rbp rsp rip r8 r9 r10 r11 r12 r13 r14 r15".split()
-}
+# global vars #
+lisaversion             =   'v-san'
+PAGE_SIZE               =   4096
+MAX_DISTANCE            =   PAGE_SIZE*10
+###################
 
 ####################################
 #             Misc Utils           #
 ####################################
+g_ignore_frame_pointer  =   False
+
 def banner(debugger,command,result,dict):
     
     lisa2="""
@@ -261,14 +242,14 @@ def setMallocDebug(debugger,c,result,dict):
     return True
 
 # execute given LLDB command
-def execute(debugger,lldb_command,result,dict):
+def execute(debugger, lldb_command, result, dict):
     """
         Execute given command and print the outout to stdout
     """
     debugger.HandleCommand(lldb_command)
 
 # execute command and return output
-def executeReturnOutput(debugger,lldb_command,result,dict):
+def executeReturnOutput(debugger,lldb_command, result, dict):
     """Execute given command and returns the outout"""
     ci = debugger.GetCommandInterpreter()
     res = lldb.SBCommandReturnObject()
@@ -280,17 +261,14 @@ def executeReturnOutput(debugger,lldb_command,result,dict):
 def s(debugger,command,result,dict):
     """step command"""
     executeReturnOutput(debugger,"thread step-in",result,dict)
-    context(debugger,command,result,dict)
 
 def si(debugger,command,result,dict):
     """step into command"""
     executeReturnOutput(debugger,"thread step-inst",result,dict)
-    context(debugger,command,result,dict)
 
 def so(debugger,command,result,dict):
     """step over"""
     executeReturnOutput(debugger,"thread step-over",result,dict)
-    context(debugger,command,result,dict)
 
 def stepnInstructions(debugger,count,result,dict):
     """step-in n time"""
@@ -301,7 +279,8 @@ def stepnInstructions(debugger,count,result,dict):
         executeReturnOutput(debugger,"thread step-in",result,dict)
         c+=1
 
-    context(debugger,command,result,dict)
+def getArch():
+    return lldb.debugger.GetSelectedTarget().triple.split('-')[0]
 
 def testjump(debugger,command,result,dict):
         """
@@ -310,7 +289,7 @@ def testjump(debugger,command,result,dict):
             True if jump is taken or False if not 
         """
         inst=None
-        flags = get_eflags(debugger,command,result,dict)
+        flags = getEflags(debugger,command,result,dict)
         if not flags:
             return None
 
@@ -356,44 +335,176 @@ def testjump(debugger,command,result,dict):
 
         return (False,None)
 
-def context(debugger,command,result,dict):
-    """Prints context of current execution"""
-    
-    try:
-        #disas
-        op, error=executeReturnOutput(debugger,"disassemble -c 2 -s $pc",result,dict)
-        print(tty_colors.red()+"[*] Disassembly :\n"+tty_colors.default())
-        print(op)
+def getProcess():
+    return lldb.debugger.GetSelectedTarget().process
 
-        #stack
-        op, error=executeReturnOutput(debugger,"x/10x $sp",result,dict)
-        print(tty_colors.red()+"[*] Stack :\n"+tty_colors.default())
-        print(tty_colors.blue()+op+tty_colors.default())
+def getFrame():
+    #return lldb.debugger.GetSelectedTarget().process.selected_thread.GetSelectedFrame(); 
+    #return lldb.debugger.GetSelectedTarget().GetProcess().GetSelectedThread().GetSelectedFrame()
+    #return lldb.debugger.GetTargetAtIndex(0).process.selected_thread.GetFrameAtIndex(0);
+        
+    #return frame for stopped thread... there should be one at least...
+    ret = None;
+    for t in getProcess():
+        if t.GetStopReason() != lldb.eStopReasonNone and t.GetStopReason() != lldb.eStopReasonInvalid:
+            ret = t.GetFrameAtIndex(0);
 
-        #registers
-        op, error=executeReturnOutput(debugger,"register read",result,dict)
-        print(tty_colors.red()+"[*] Registers\t:"+tty_colors.default())
-        print(op.split("\n\n")[0].split('General Purpose Registers:\n')[1].split('eflags')[0])
-        print('\n')
+    return ret;
 
-        #jump
-        dis, error=executeReturnOutput(debugger,'disassemble -c 1 -s $pc',result,dict)
-        if dis:
-            dis = dis.split(': ')[1].split()[0]
+def ls(debugger, args, result, dict):
+    for res in Symbol.list(target, args.glob, all=args.all, ignorecase=args.ignorecase):
+        print (res)
+    return
 
-            if 'j' in dis:
-                jumpto, destination = testjump(debugger,command,result,dict)
-                if jumpto==True:
-                    print(tty_colors.red()+"[*] Jumping to\t:"+destination+tty_colors.default())
+def searchMem(debugger, args, result, dict):
+
+    args=shlex.split(args)
+    parser = argparse.ArgumentParser(prog="searchmem");
+    parser.add_argument("-s", "--string",  help="string to look for");
+    parser.add_argument("-c", "--count", type=int, default=10,  help="number of results to print");
+
+    args = parser.parse_args(args)
+
+    to_search = args.string
+
+    if not to_search:
+        parser.print_help()
+        return
+
+    count     = args.count 
+
+    process = getProcess()
+    pid     = process.GetProcessID()
+
+    vmmemory  = subprocess.check_output(["vmmap", "%d" % pid], shell=False)
+
+    memory_address_ranges = []
+    address_regex = re.compile("([0-9a-fA-F]{16})-([0-9a-fA-F]{16})")
+
+    for line in vmmemory.split("\n"):
+        mem = address_regex.search(line)
+
+        if not mem:
+            continue;
+
+        mem_start       = long(mem.group(1), 16)
+        mem_end         = long(mem.group(2), 16)
+
+        mem_size        = mem_end-mem_start
+        memory_buff     = readMem(mem_start, mem_size);
+
+        offset = 0
+        if memory_buff:
+            while True:
+                mem_location = memory_buff.find(to_search)
+                if not mem_location==-1:
+                    offset+=mem_location
+                    value = memory_buff[mem_location:mem_location+len(to_search)+16]
+                    print(tty_colors.green()+"%.016lX"%(mem_start+offset)+tty_colors.default()+"\t%s"%(value))
+                    memory_buff = memory_buff[mem_location+len(to_search):]
+                    offset += len(to_search)
                 else:
-                    print(tty_colors.red()+"[*] Jump not taken."+tty_colors.default())
+                    break
+
+                if count==1:
+                    return
+                count-=1
+
+
+def readMem(addrStart, addrSize):
+    error = lldb.SBError()
+    process = getProcess() 
+    memory_buff = process.ReadMemory(addrStart, addrSize, error)
+    if not error.Success():
+        return None
+
+    return memory_buff
+
+def vtable(debugger, command, result, dict):
+    op, err = executeReturnOutput(debugger,'im loo -r -v -s "vtable for"', result, dict)
+    if not err:
+        print(op)
+        return
+
+def context(debugger,command,result,dict):
+    """prints context of current execution"""
+    debugger.SetAsync(True)
+    frame = getFrame()
+
+    if not frame:
+        return
+    
+    thread = frame.GetThread()
+
+    pc = getregvalue(debugger, "pc", result, dict)
+
+    res = lldb.SBCommandReturnObject()
+    #disassembly
+    lldb.debugger.GetCommandInterpreter().HandleCommand("disassemble --start-address=" + pc + " --count=4", res)
+    disas = res.GetOutput().split("\n")
+    
+    pc_text = int(str(pc).strip().split()[0], 16)
+    pc_text = hex(pc_text)
+
+    print(tty_colors.blue()+"[disassembly]"+tty_colors.default())
+
+    for item,value in enumerate(disas):
+        if pc_text in value:
+            print(tty_colors.red()+value+tty_colors.default())
         else:
-            print(error)
+            print(value)
 
-    except Exception as e:
-        print('error running context')
+    print(tty_colors.blue()+"[/disassembly]"+tty_colors.default())
+    
+    #jump
+    dis, error=executeReturnOutput(debugger,'disassemble -c 1 -s $pc',result,dict)
+    if dis:
+        dis = dis.split(': ')[1].split()[0]
 
-def get_eflags(debugger,command,result,dict):
+        if 'j' in dis:
+            print
+            print(tty_colors.blue()+"[jump]"+tty_colors.default())
+            jumpto, destination = testjump(debugger,command,result,dict)
+            if jumpto==True:                
+                print(tty_colors.red()+"Jumping to "+destination+tty_colors.default())
+                print(tty_colors.blue()+"disassembly at "+destination+tty_colors.default())
+
+                lldb.debugger.GetCommandInterpreter().HandleCommand("disassemble --start-address " + destination + " --count=2", res)
+                disas = res.GetOutput().split("\n")
+
+                for item,value in enumerate(disas):
+                    if pc_text in value:
+                        print(tty_colors.red()+value+tty_colors.default())
+                    else:
+                        print(value)                
+            else:
+                print(tty_colors.red()+"\tJump not taken."+tty_colors.default())
+
+            print(tty_colors.blue()+"[/jump]"+tty_colors.default())
+
+    #registers
+    print
+    lldb.debugger.GetCommandInterpreter().HandleCommand("disassemble --start-address=" + pc + " --count=1", res)
+    data = res.GetOutput().split("\n")[1]
+
+    
+    op, error=executeReturnOutput(debugger,"register read",result,dict)
+    print(tty_colors.blue()+"[registers]"+tty_colors.default())
+    for reg in op.split("\n\n")[0].split('General Purpose Registers:\n')[1].split('eflags')[0].split("\n"):
+        reg         = reg.split(" = ")
+        reg_value   = " = ".join(reg[1:])
+        reg         = reg[0].strip(" ")
+        
+        if reg in data:
+            print("\t",tty_colors.red()+reg+tty_colors.default()+" = "+tty_colors.red()+reg_value+tty_colors.default())
+        else:
+            print("\t",tty_colors.green()+reg+tty_colors.default()+" = "+tty_colors.green()+reg_value+tty_colors.default())
+
+    print(tty_colors.blue()+"[/registers]"+tty_colors.default())
+
+    return
+
+def getEflags(debugger,command,result,dict):
     """
     Get flags value from EFLAGS register
 
@@ -415,13 +526,15 @@ def get_eflags(debugger,command,result,dict):
 
 
 #pattern create and pattern offset
-def pattern_create(debugger,size,result,dict):
+def patternCreate(debugger,size, result, dict):
     """creates a cyclic pattern of given length"""
 
     try:
         length = int(size)
     except:
-        print("[+] Usage: pattern_create <length> [set a] [set b] [set c]")
+        print("[+] Usage: patternCreate <length>")
+        return
+
     seta = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     setb = "abcdefghijklmnopqrstuvwxyz"
     setc = "0123456789"
@@ -440,7 +553,7 @@ def pattern_create(debugger,size,result,dict):
     return string[:length]
 
 #check if given pattern is in cyclic pattern
-def check_if_cyclic(debugger,pat,result,dict):
+def checkIfCyclic(debugger,pat,result,dict):
     """check if given pattern is in cyclic pattern"""
 
     #seta="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -448,7 +561,7 @@ def check_if_cyclic(debugger,pat,result,dict):
     #setc="0123456789"
     
     if not pat:
-        print('[+] Usage: check_if_cyclic <some string>')
+        print('[+] Usage: checkIfCyclic <some string>')
         return
 
     string=pat ; a=0 ; b=0 ; c=0
@@ -496,14 +609,14 @@ def check_if_cyclic(debugger,pat,result,dict):
     return True
 
 #pattern search
-def pattern_offset(debugger,sizepat,result,dict):
+def patternOffset(debugger,sizepat,result,dict):
     """search offset of pattern."""
     
     if len(sizepat.split(' '))==2:
         try:
             size=int(sizepat.split(' ')[0])
             pat=sizepat.split(' ')[1]
-            pattern=pattern_create(debugger,size,result,dict)
+            pattern=patternCreate(debugger,size,result,dict)
             if "0x" in pat:
                 pat=pat.replace("0x","")
                 pat=pat.decode("hex")[::-1]
@@ -517,13 +630,13 @@ def pattern_offset(debugger,sizepat,result,dict):
                 print('offsets:',found)
         except:
             print("please check the syntax")
-            print("pattern_offset 250 Aa2A")
+            print("patternOffset 250 Aa2A")
                 
     elif len(sizepat.split(' '))==1:
         try:
             size=10000
             pat=sizepat.split(' ')[1]
-            pattern=pattern_create(debugger,size,result,dict,True)
+            pattern=patternCreate(debugger,size,result,dict,True)
             if "0x" in pat:
                 pat=pat.replace("0x","")
                 pat=pat.decode("hex")[::-1]
@@ -538,7 +651,7 @@ def pattern_offset(debugger,sizepat,result,dict):
                 print(found)
         except:
             print("please check the syntax")
-            print("pattern_offset 250 Aa2A")
+            print("patternOffset 250 Aa2A")
 
 #return address in register
 def getregvalue(debugger,reg,result,dict):
@@ -574,7 +687,6 @@ def getexception(exception_description):
 
 def getsignal(signal_description):
     return signal_description.split(' ')[1]
-
 
 def type_for_two_memory(access_address, disassembly):
     first_reg_val = value_for_first_register(disassembly)
@@ -665,50 +777,6 @@ def getexceptiontype(access_address, disassembly, registers):
         type_ = "unknown"
         return type_
 
-def is_stack_suspicious(exc_address, exception, backtrace):
-    global reportexploitable
-    global is_exploitable
-
-    suspicious_functions = """__chk_fail __stack_chk_fail szone_error CFRelease CFRetain
-        _CFRelease _CFRetain malloc calloc realloc objc_msgSend szone_free free_small
-        tiny_free_list_add_ptr tiny_free_list_remove_ptr small_free_list_add_ptr
-        small_free_list_remove_ptr large_entries_free_no_lock large_free_no_lock
-        szone_batch_free szone_destroy free CSMemDisposeHandle CSMemDisposePtr append_int
-        release_file_streams_for_task __guard_setup _CFStringAppendFormatAndArgumentsAux
-        WTF::fastFree WTF::fastMalloc WTF::FastCalloc WTF::FastRealloc WTF::tryFastCalloc
-        WTF::tryFastMalloc WTF::tryFastRealloc WTF::TCMalloc_Central_FreeList GMfree
-        GMmalloc_zone_free GMrealloc GMmalloc_zone_realloc""".split()
-
-    if exc_address=="0xbbadbeef":
-        # WebCore functions call CRASH() in various assertions or if the amount to allocate was too big. CRASH writes a null byte to 0xbbadbeef.
-        is_exploitable=False
-        print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
-        reportexploitable = "Not exploitable. Seems to be a safe crash. Calls to CRASH() function writes a null byte to 0xbbadbeef"
-        print(tty_colors.red() + reportexploitable + tty_colors.default())
-        return 
-
-    if "0   ???" in backtrace:
-        is_exploitable = True
-        print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
-        reportexploitable="This crash is suspected to be exploitable because the crashing instruction is outside of a known function, i.e. in dynamically generated code"
-        print(tty_colors.red() + reportexploitable + tty_colors.default())
-        return
-
-    for i in suspicious_functions:
-        if i in backtrace:
-            if exception == "EXC_BREAKPOINT" and i in ("CFRelease", "CFRetain"):
-                is_exploitable = "no"
-                return
-            elif i=="_CFRelease" or i=="CFRelease" and "CGContextDelegateFinalize" in backtrace:
-                return
-            elif i=="objc_msgSend" and exc_address<<PAGE_SIZE:
-                continue
-            else:
-                is_exploitable = True
-                print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
-                reportexploitable="The crash is suspected to be an exploitable issue due to the suspicious function in the stack trace of the crashing thread."
-                print(tty_colors.red() + reportexploitable + tty_colors.default())
-                return
 
 #return whether or not the base pointer is far away from the stack pointer.
 def bp_inconsistent_with_sp(bp_val,sp_val):
@@ -748,7 +816,8 @@ class Lisa:
             self.exception = None
 
             print(tty_colors.red()+"Signal : "+self.signal+tty_colors.default())
-            
+            self.is_stack_suspicious()        
+
         else:
             return
 
@@ -762,101 +831,144 @@ class Lisa:
                 
                 if self.exc_address and int(self.exc_address,0)==int(self.pc,0):
                     # IP over write
-                    is_exploitable = True
-                    print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
-                    reportexploitable="Trying to execute a bad address, this is a potentially exploitable issue"
-                    print(tty_colors.red() + reportexploitable + tty_colors.default())
+                    self.is_exploitable = True
+                    print(tty_colors.red()+"Exploitable = %s"%self.is_exploitable+tty_colors.default())
+                    self.reportexploitable="Trying to execute a bad address, this is a potentially exploitable issue"
+                    print(tty_colors.red() + self.reportexploitable + tty_colors.default())
                 else:
                     self.access_type = getexceptiontype(self.exc_address, self.pc_disas, self.registers)
                     
                     if self.exc_address and int(self.exc_address,16)<int(PAGE_SIZE):
-                        is_exploitable=False
-                        print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
-                        reportexploitable="Null Dereference. Probably not exploitable"
-                        print(tty_colors.blue() + reportexploitable + tty_colors.default())
+                        self.is_exploitable=False
+                        print(tty_colors.red()+"Exploitable = %s"%self.is_exploitable+tty_colors.default())
+                        self.reportexploitable="Null Dereference. Probably not exploitable"
+                        print(tty_colors.blue() + self.reportexploitable + tty_colors.default())
                         return
 
                     elif self.access_type == "recursion":
-                        is_exploitable=False
+                        self.is_exploitable=False
 
                         stack=self.backtrace
                         MINIMUM_RECURSION_LENGTH = 300
                         stack_length= len(stack.split("\n"))
 
                         if stack_length>MINIMUM_RECURSION_LENGTH:
-                            print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
-                            reportexploitable="The crash is suspected to be not exploitable due to unbounded recursion since there were %d stack frames."%stack_length
-                            print(tty_colors.blue() + reportexploitable + tty_colors.default())
+                            print(tty_colors.red()+"Exploitable = %s"%self.is_exploitable+tty_colors.default())
+                            self.reportexploitable="The crash is suspected to be not exploitable due to unbounded recursion since there were %d stack frames."%stack_length
+                            print(tty_colors.blue() + self.reportexploitable + tty_colors.default())
                             return
                     else:
-                        is_exploitable=True
+                        self.is_exploitable=True
 
                     if self.access_type == "exec":
-                        is_exploitable = True
+                        self.is_exploitable = True
 
                     addr = self.exc_address
                     max_offset = 1024
 
                     if (addr > 0x55555555 - max_offset and addr < 0x55555555 + max_offset):
-                        print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
-                        reportexploitable="The access address indicates the use of freed memory if MallocScribble was used, or uninitialized memory if libgmalloc and MALLOC_FILL_SPACE was used."
-                        print(tty_colors.red() + reportexploitable + tty_colors.default())
+                        print(tty_colors.red()+"Exploitable = %s"%self.is_exploitable+tty_colors.default())
+                        self.reportexploitable="The access address indicates the use of freed memory if MallocScribble was used, or uninitialized memory if libgmalloc and MALLOC_FILL_SPACE was used."
+                        print(tty_colors.red() + self.reportexploitable + tty_colors.default())
                     
                     elif (addr > 0xaaaaaaaa - max_offset and addr < 0xaaaaaaaa + max_offset):
-                        print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())                
-                        reportexploitable="The access address indicates that uninitialized memory was being used if MallocScribble was used."
-                        print(tty_colors.red() + reportexploitable + tty_colors.default())
+                        print(tty_colors.red()+"Exploitable = %s"%self.is_exploitable+tty_colors.default())                
+                        self.reportexploitable="The access address indicates that uninitialized memory was being used if MallocScribble was used."
+                        print(tty_colors.red() + self.reportexploitable + tty_colors.default())
 
                     elif "EXC_I386_GPFLT" == self.exc_code:
-                        print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
-                        reportexploitable="The exception code indicates that the access address was invalid in the 64-bit ABI (it was > 0x0000800000000000)."
-                        print(tty_colors.red() + reportexploitable + tty_colors.default())
+                        print(tty_colors.red()+"Exploitable = %s"%self.is_exploitable+tty_colors.default())
+                        self.reportexploitable="The exception code indicates that the access address was invalid in the 64-bit ABI (it was > 0x0000800000000000)."
+                        print(tty_colors.red() + self.reportexploitable + tty_colors.default())
 
                     elif not g_ignore_frame_pointer and bp_inconsistent_with_sp(self.bp,self.sp):
-                        is_exploitable = True
-                        print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
-                        reportexploitable="Presumed exploitable based on the discrepancy between the stack pointer and base pointer registers."
-                        print(tty_colors.red() + reportexploitable + tty_colors.default())
+                        self.is_exploitable = True
+                        print(tty_colors.red()+"Exploitable = %s"%self.is_exploitable+tty_colors.default())
+                        self.reportexploitable="Presumed exploitable based on the discrepancy between the stack pointer and base pointer registers."
+                        print(tty_colors.red() + self.reportexploitable + tty_colors.default())
                     else:
-                        print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
+                        print(tty_colors.red()+"Exploitable = %s"%self.is_exploitable+tty_colors.default())
 
                         if self.access_type in ("read", "write"):
-                            reportexploitable = "Crash "+self.access_type+"'g invalid address."
+                            self.reportexploitable = "Crash "+self.access_type+"'g invalid address."
                         else:
-                            reportexploitable = "Crash accessing invalid address."
-                        print(tty_colors.red() + reportexploitable + tty_colors.default())
+                            self.reportexploitable = "Crash accessing invalid address."
+                        print(tty_colors.red() + self.reportexploitable + tty_colors.default())
 
             elif self.exception=="EXC_BAD_INSTRUCTION":
-                is_exploitable = True
-                print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
-                reportexploitable="Illegal instruction at %s, probably a exploitable issue unless the crash was in libdispatch/xpc."%self.pc
-                print(tty_colors.blue() + reportexploitable + tty_colors.default())
+                self.is_exploitable = True
+                print(tty_colors.red()+"Exploitable = %s"%self.is_exploitable+tty_colors.default())
+                self.reportexploitable="Illegal instruction at %s, probably a exploitable issue unless the crash was in libdispatch/xpc."%self.pc
+                print(tty_colors.blue() + self.reportexploitable + tty_colors.default())
 
             elif self.exception=="EXC_ARITHMETIC":
-                is_exploitable = False
-                print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
-                reportexploitable="Arithmetic exception at %s, probably not exploitable."%self.pc
-                print(tty_colors.blue() + reportexploitable + tty_colors.default())
+                self.is_exploitable = False
+                print(tty_colors.red()+"Exploitable = %s"%self.is_exploitable+tty_colors.default())
+                self.reportexploitable="Arithmetic exception at %s, probably not exploitable."%self.pc
+                print(tty_colors.blue() + self.reportexploitable + tty_colors.default())
 
             elif self.exception=="EXC_SOFTWARE":
-                is_exploitable=False
-                print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
-                reportexploitable="Software exception, probably not exploitable."
-                print(tty_colors.blue() + reportexploitable + tty_colors.default())
+                self.is_exploitable=False
+                print(tty_colors.red()+"Exploitable = %s"%self.is_exploitable+tty_colors.default())
+                self.reportexploitable="Software exception, probably not exploitable."
+                print(tty_colors.blue() + self.reportexploitable + tty_colors.default())
 
             elif self.exception=="EXC_BREAKPOINT":
-                is_exploitable=False
-                print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
-                reportexploitable="Software breakpoint, probably not exploitable."
-                print(tty_colors.blue() + reportexploitable + tty_colors.default())
+                self.is_exploitable=False
+                print(tty_colors.red()+"Exploitable = %s"%self.is_exploitable+tty_colors.default())
+                self.reportexploitable="Software breakpoint, probably not exploitable."
+                print(tty_colors.blue() + self.reportexploitable + tty_colors.default())
             
             elif self.exc_address=="EXC_CRASH":
-                is_exploitable= False
-                print(tty_colors.red()+"Exploitable = %s"%is_exploitable+tty_colors.default())
+                self.is_exploitable= False
+                print(tty_colors.red()+"Exploitable = %s"%self.is_exploitable+tty_colors.default())
 
-        elif self.signal:
-            is_stack_suspicious(self.exc_address, self.exception, self.backtrace)
-        
+
+    def is_stack_suspicious(self):
+        exc_address = self.exc_address
+        exception   = self.exception
+        backtrace   = self.backtrace
+
+        suspicious_functions = """__chk_fail __stack_chk_fail szone_error CFRelease CFRetain
+            _CFRelease _CFRetain malloc calloc realloc objc_msgSend szone_free free_small
+            tiny_free_list_add_ptr tiny_free_list_remove_ptr small_free_list_add_ptr
+            small_free_list_remove_ptr large_entries_free_no_lock large_free_no_lock
+            szone_batch_free szone_destroy free CSMemDisposeHandle CSMemDisposePtr append_int
+            release_file_streams_for_task __guard_setup _CFStringAppendFormatAndArgumentsAux
+            WTF::fastFree WTF::fastMalloc WTF::FastCalloc WTF::FastRealloc WTF::tryFastCalloc
+            WTF::tryFastMalloc WTF::tryFastRealloc WTF::TCMalloc_Central_FreeList GMfree
+            GMmalloc_zone_free GMrealloc GMmalloc_zone_realloc""".split()
+
+        if exc_address=="0xbbadbeef":
+            # WebCore functions call CRASH() in various assertions or if the amount to allocate was too big. CRASH writes a null byte to 0xbbadbeef.
+            self.is_exploitable=False
+            print(tty_colors.red()+"Exploitable = %s"%self.is_exploitable+tty_colors.default())
+            self.reportexploitable = "Not exploitable. Seems to be a safe crash. Calls to CRASH() function writes a null byte to 0xbbadbeef"
+            print(tty_colors.red() + self.reportexploitable + tty_colors.default())
+            return 
+
+        if "0   ???" in backtrace:
+            self.is_exploitable = True
+            print(tty_colors.red()+"Exploitable = %s"%self.is_exploitable+tty_colors.default())
+            self.reportexploitable="This crash is suspected to be exploitable because the crashing instruction is outside of a known function, i.e. in dynamically generated code"
+            print(tty_colors.red() + self.reportexploitable + tty_colors.default())
+            return
+
+        for i in suspicious_functions:
+            if i in backtrace:
+                if exception == "EXC_BREAKPOINT" and i in ("CFRelease", "CFRetain"):
+                    self.is_exploitable = "no"
+                    return
+                elif i=="_CFRelease" or i=="CFRelease" and "CGContextDelegateFinalize" in backtrace:
+                    return
+                elif i=="objc_msgSend" and exc_address<<PAGE_SIZE:
+                    continue
+                else:
+                    self.is_exploitable = True
+                    print(tty_colors.red()+"Exploitable = %s"%self.is_exploitable+tty_colors.default())
+                    self.reportexploitable="The crash is suspected to be an exploitable issue due to the suspicious function in the stack trace of the crashing thread."
+                    print(tty_colors.red() + self.reportexploitable + tty_colors.default())
+                    return
 
 def exploitable(debugger,cmd,res,dict):
     """checks if the crash is exploitable"""
@@ -869,10 +981,9 @@ class ShellStorm:
     def searchShellcode(self, keyword):
         try:
             print("Connecting to shell-storm.org...")
-            s = httplib.HTTPConnection("shell-storm.org")
-            s.request("GET", "/api/?s="+str(keyword))
-            res = s.getresponse()
-            data_l = res.read().split('\n')
+            s = requests.get("http://shell-storm.org/api/?s=%s"%(keyword))
+            res = s.text
+            data_l = res.split('\n')
         except:
             print("Cannot connect to shell-storm.org")
             return None
@@ -917,16 +1028,9 @@ class ShellStorm:
             return None
 
         try:
-            print("Connecting to shell-storm.org...")
-            s = httplib.HTTPConnection("shell-storm.org")
-        except:
-            print("Cannot connect to shell-storm.org")
-            return None
-
-        try:
-            s.request("GET", "/shellcode/files/shellcode-"+str(shellcodeId)+".php")
-            res = s.getresponse()
-            data = res.read().split("<pre>")[1].split("<body>")[0]
+            s = requests.get("http://shell-storm.org/shellcode/files/shellcode-%s.php"%(shellcodeId))
+            res = s.text
+            data = res.split("<pre>")[1].split("<body>")[0]
         except:
             print("Failed to download shellcode from shell-storm.org")
             return None
@@ -946,7 +1050,7 @@ class ShellStorm:
         print("http://shell-storm.org")
         return
 
-def extract_from_universal_binary(debugger,command,result,dict):
+def extractFromUniversalBinary(debugger,command,result,dict):
     """Uses lipo to extract a given architecture from a Universal binary
         Syntax: extract x86_64 <input file> <output file>
         Ex: extract x86_64 /usr/lib/system/libsystem_kernel.dylib ./libsystem_kernel.dylib
@@ -955,11 +1059,9 @@ def extract_from_universal_binary(debugger,command,result,dict):
     args = shlex.split(command)
     if len(args)==3:
         architecture, intputfile, outputfile = args
-        subprocess.call(['lipo', intputfile, '-extract', architecture, '-output', outputfile])
+        subprocess.check_output(['lipo', intputfile, '-extract', architecture, '-output', outputfile], shell=False)
     else:
         print("Syntax: extract x86_64 /usr/lib/system/libsystem_kernel.dylib ./libsystem_kernel.dylib")
-
-
 
 def shellcode(debugger, command, result, dict):
     """Searches shell-storm for shellcode
@@ -984,8 +1086,9 @@ def shellcode(debugger, command, result, dict):
             print("Shellcode not found")
             sys.exit(0)
 
-        print("Found %d shellcodes" % len(res_dl))
-        print("%s\t%s %s" %("ScId", "Size", "Title"))
+        
+        print(tty_colors.red()+"Found %d shellcodes" % len(res_dl)+tty_colors.default())
+        print(tty_colors.green()+"%s\t%s %s" %("ScId", "Size", "Title")+tty_colors.default())
         for data_d in res_dl:
             if data_d['ScSize'] == 0:
                 print("[%s]\tn/a  %s - %s"%(data_d['ScId'], data_d['ScArch'], data_d['ScTitle']))
@@ -1009,35 +1112,87 @@ def shellcode(debugger, command, result, dict):
         with open(filename,'w') as f:
             f.write(res)    
         print(tty_colors.red()+"Written to file shellcode_"+filename+'.c'+tty_colors.default())
+    return
 
-    
 
-def dump(debugger,command,result,dict):
+def coredump(debugger,command,result,dict):
+    """
+        dump entire process memory
+    """
+    binary_name = lldb.target.executable.basename
+    execute(debugger, 'process save-core "%s.core"'%(binary_name),result,dict)
+    return
+
+def dump(debugger,args,result,dict):
     """Dump's Memory of the process in a given address range
        Syntax: dump outfile 0x6080000fe680 0x6080000fe680+1000
             dump will not read over 1024 bytes of data. To overwride this use -f
-       Syntax: dump outfile 0x6080000fe680 0x6080000fe680+1000 -f"""
+       Syntax: dump -o outfile -s 0x6080000fe680 -e 0x6080000fe680+1000 -f"""
 
-    args = shlex.split(command)
-    if len(args)<3:
-        print("Syntax: dump outfile 0x6080000fe680 0x6080000fe680+1000")
-        return
+    args=shlex.split(args)
 
-    outfile, start_range, end_range = args[:3]
-    force = len(args) > 3
-    if force:
-        output,error=executeReturnOutput(debugger,"memory read -b --force --outfile "+outfile+' '+start_range+' '+end_range,result,dict)    
+    parser = argparse.ArgumentParser(prog="dump memory in the memory given range");
+    parser.add_argument("-s", "--start",  required=True, help="start address");
+    parser.add_argument("-e", "--end", required=True, help="end address");
+    parser.add_argument("-o", "--outfile", help="file to save the dump to");
+    parser.add_argument("-f", "--force", default=0, type=int, help="dump will not read over 1024 bytes of data. To overwride this use -f. 0(false) or 1(true)");
+
+    args = parser.parse_args(args)
+    start_range = args.start
+    end_range   = args.end
+
+    if args.force==1:
+        if args.outfile:
+            output, error=executeReturnOutput(debugger,"memory read -b --force --outfile %s %s %s"%(args.outfile, start_range, end_range),result,dict)    
+        else:
+            output, error=executeReturnOutput(debugger,"memory read -b %s %s"%(start_range, end_range),result,dict)    
     else:
-        output,error=executeReturnOutput(debugger,"memory read -b --outfile "+outfile+' '+start_range+' '+end_range,result,dict)
+        if args.outfile:
+            output, error=executeReturnOutput(debugger,"memory read -b --force --outfile %s %s %s"%(args.outfile, start_range, end_range),result,dict)    
+        else:
+            output, error=executeReturnOutput(debugger,"memory read -b %s %s"%(start_range, end_range),result,dict)    
 
     if not error:
-        print(output)
+        if not args.outfile:
+            print(output)
+
     else:
         if "--force" in error:
             print("dump will not read over 1024 bytes of data. To overwride this use -f.")
             print("Syntax: dump outfile 0x6080000fe680 0x6080000fe680+1000 -f")
         else:
             print(error)
+
+def symbols(debugger, string, result, dict):
+    results = return_symbols(debugger, string)
+    if results:
+        for i in results:
+            print(i)
+        return
+
+    print('Nothing found')
+
+def return_symbols(debugger, string):
+    module_to_search = None
+    result = []
+    if string:
+        if "`" in string:
+            module_to_search, string_to_search = string.split("`", 1)
+        else:
+            string_to_search = string
+
+        modules = debugger.GetSelectedTarget().modules
+        
+        for module in modules:
+            if module_to_search and not fnmatch.fnmatch(module.file.basename.lower(), module_to_search.lower()):
+                continue
+
+            prefix = module.file.basename + "`"
+            for i in module.symbols:
+                if fnmatch.fnmatch((i.name).lower(), string_to_search.lower()):
+                    result.append('%s '%(prefix+"%s"%i))
+        return result
+    return None
 
 class MACH_HEADER(Structure):
     _fields_ = [
@@ -2812,7 +2967,6 @@ architectures supported:
                 sys.exit(-1)
 
     def __printVersion(self):
-        print("Version:        %s" %(PYROPGADGET_VERSION))
         print("Author:         Jonathan Salwan" )
         print("Author page:    https://twitter.com/JonathanSalwan" )
         print("Project page:   http://shell-storm.org/project/ROPgadget/" )
@@ -2866,23 +3020,72 @@ architectures supported:
   rop --binary ./test-suite-binaries/elf-ARM64-bash --depth 5
   rop --binary ./test-suite-binaries/raw-x86.raw --rawArch=x86 --rawMode=32""")
 
+def launch(debugger, com, result, dict):
+    process_to_launch = com
+    for i in glob.glob("/Applications/*.app"):
+        application = os.path.basename(i).replace(".app","")
+        
+        if fnmatch.fnmatch(application.lower(),process_to_launch.lower()):
+            execute(debugger, "target create '%s'"%(i), result, dict)
+            run = raw_input(tty_colors.green()+"Shall i run %s?y/n : "%(i)+tty_colors.default())
+            if run=="y":
+                execute(debugger, "run", result, dict)
+
+            return
+
+    print("Nothing found")
+
+def backtrace(debugger, command, result, dict):
+    bt = executeReturnOutput(debugger, "thread backtrace", result, dict)[0].split("\n")
+    thread = bt[0]
+    print(thread)
+
+    for i in bt[1:]:
+        
+        if i.startswith("  * frame"):
+            print(tty_colors.red()+i+tty_colors.default())
+            pc = getregvalue(debugger,"pc",result,dict)
+            disassemble = executeReturnOutput(debugger, "disassemble --start-address=" + pc + " --count=4", result, dict)[0].split("\n")
+            print(tty_colors.blue()+"\t[disassembly]"+tty_colors.default())
+            print(tty_colors.green()+"\t\t%s"%(disassemble[0])+tty_colors.default())
+            print(tty_colors.red()+"\t\t%s"%(disassemble[1])+tty_colors.default())
+            for i in disassemble[2:]:
+                print(tty_colors.green()+"\t\t%s"%(i)+tty_colors.default())
+
+            print(tty_colors.blue()+"\t[/disassembly]"+tty_colors.default())
+        else:
+            print(i)
+
 def __lldb_init_module(debugger, dict):
-    
-    debugger.HandleCommand('command script add --function lisa.exploitable exploitable')
-    debugger.HandleCommand('command script add --function lisa.pattern_create pattern_create')
-    debugger.HandleCommand('command script add --function lisa.pattern_offset pattern_offset')
-    debugger.HandleCommand('command script add --function lisa.check_if_cyclic check_if_cyclic')
+
+    debugger.HandleCommand('settings set target.x86-disassembly-flavor intel')
+
     debugger.HandleCommand('command script add --function lisa.stepnInstructions sf')
     debugger.HandleCommand('command script add --function lisa.context ct')
     debugger.HandleCommand('command script add --function lisa.s s')
     debugger.HandleCommand('command script add --function lisa.si si')
     debugger.HandleCommand('command script add --function lisa.so so')
+    debugger.HandleCommand('command script add --function lisa.backtrace pbt')    
     debugger.HandleCommand('command script add --function lisa.banner banner')
+    debugger.HandleCommand('command script add --function lisa.patternCreate patterncreate')
+    debugger.HandleCommand('command script add --function lisa.patternOffset patternoffset')
+    debugger.HandleCommand('command script add --function lisa.checkIfCyclic checkifcyclic')    
     debugger.HandleCommand('command script add --function lisa.exploitable exploitable')
-    debugger.HandleCommand('command script add -function lisa.setMallocDebug setmalloc')
-    debugger.HandleCommand('command script add -function lisa.shellcode shellcode')
-    debugger.HandleCommand('command script add -function lisa.extract_from_universal_binary extract')
-    debugger.HandleCommand('command script add --function lisa.dump dump')
+    debugger.HandleCommand('command script add --function lisa.setMallocDebug setmalloc')
+    debugger.HandleCommand('command script add --function lisa.shellcode shellcode')
     debugger.HandleCommand('command script add --function lisa.rop rop')
+    debugger.HandleCommand('command script add --function lisa.extractFromUniversalBinary extract')
+    debugger.HandleCommand('command script add --function lisa.dump dump')
+    debugger.HandleCommand('command script add --function lisa.coredump coredump')
+    debugger.HandleCommand('command script add --function lisa.searchMem search')
+    debugger.HandleCommand('command script add --function lisa.symbols symbol')
+    debugger.HandleCommand('command script add --function lisa.vtable vtable')
+    debugger.HandleCommand('command script add --function lisa.launch launch')
+    debugger.HandleCommand('command script add --function lisa.shell shell')
+
+    debugger.HandleCommand('banner')
+
+    res = lldb.SBCommandReturnObject()
+    executeReturnOutput(debugger, 'target stop-hook add -o ct', res, dict)
 
 tty_colors = TerminalColors (True)
