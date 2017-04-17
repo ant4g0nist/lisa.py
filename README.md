@@ -1,7 +1,7 @@
 # lisa.py
 -An Exploit Dev Swiss Army Knife. 
 
-#Installation
+# Installation
 Copy lisa.py and .lldbinit to ~/ 
 Use the following commands:
 
@@ -45,7 +45,7 @@ Use the following commands:
 	    0x7fff5fc01006 <+6>: and    rsp, -0x10
 	Process 1660 launched: '/Users/v0id/Documents/Research/lisa.py/tests/binaries/abort' (x86_64)
 
-#Commands Available:
+# Commands Available:
 	
 	
 	**exploitable** : checks if the crash is exploitable
