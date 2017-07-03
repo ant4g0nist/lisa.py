@@ -1,7 +1,13 @@
 # lisa.py
 -An Exploit Dev Swiss Army Knife. 
 
-#Installation
+## Donation:
+
+If you like the project, you can buy me beers :) 
+
+[![Donate Bitcoin](https://img.shields.io/badge/donate-bitcoin-green.svg)](https://ant4g0nist.github.io)
+
+## Installation
 Copy lisa.py and .lldbinit to ~/ 
 Use the following commands:
 
@@ -45,7 +51,7 @@ Use the following commands:
 	    0x7fff5fc01006 <+6>: and    rsp, -0x10
 	Process 1660 launched: '/Users/v0id/Documents/Research/lisa.py/tests/binaries/abort' (x86_64)
 
-#Commands Available:
+## Commands Available:
 	
 	
 	**exploitable** : checks if the crash is exploitable
@@ -502,22 +508,22 @@ You can test lisa.py against CrashWranglers's test cases
 	ant4g0nist$ python test.py
 
 
-Thanks:
+## Thanks:
 
-	- Mona.py : https://github.com/corelan/mona
+- Mona.py : https://github.com/corelan/mona
 
-	- Crashwrangler : https://developer.apple.com/library/mac/technotes/tn2334/_index.html
+- Crashwrangler : https://developer.apple.com/library/mac/technotes/tn2334/_index.html
 
-	- Metasploit : https://github.com/rapid7/metasploit-framework
-	
-	- PEDA :	https://github.com/longld/peda
-	
-	- Phillips : https://www.phillips321.co.uk/2013/04/02/recreating-pattern_create-rb-in-python/
+- Metasploit : https://github.com/rapid7/metasploit-framework
 
-	- Jonathan Salwan : http://shell-storm.org/shellcode/
-	
-	- Capstone : http://www.capstone-engine.org
+- PEDA : https://github.com/longld/peda
+
+- Phillips : https://www.phillips321.co.uk/2013/04/02/recreating-pattern_create-rb-in-python/
+
+- Jonathan Salwan : http://shell-storm.org/shellcode/
+
+- Capstone : http://www.capstone-engine.org
 
 TODO:
-	add support for macho in ropmaker
+- [ ] Add support for macho in ropmaker
 	
