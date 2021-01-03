@@ -1,10 +1,12 @@
 import os
 import re
-import abc
+import cmd
 import sys
 import lldb
 import stat
+import uuid
 import shlex
+import string
 import struct
 import fnmatch
 import platform
@@ -40,10 +42,10 @@ def get_host_machine():
 	return platform.machine()
 
 def get_host_arch():
-	if get_host_machine()=="arm64":
+	if get_host_machine() == "arm64":
 		return CPU_TYPE_ARM64
 
-	elif get_host_machine()=="x86_64":
+	elif get_host_machine() == "x86_64":
 		return CPU_TYPE_X86_64
 
 def cpu_to_string(cpu):
@@ -260,402 +262,1862 @@ class LLDBCommand:
 		pass
 
 #################################################################################
+############################ Utilities  #########################################
+#################################################################################
+
+def swap_unpack_char():
+	"""Returns the unpack prefix that will for non-native endian-ness."""
+	if struct.pack('H', 1).startswith("\x00"):
+		return '<'
+	return '>'
+
+
+def dump_hex_bytes(addr, s, bytes_per_line=16):
+	i = 0
+	line = ''
+	for ch in s:
+		if (i % bytes_per_line) == 0:
+			if line:
+				print(line)
+			line = '%#8.8x: ' % (addr + i)
+		line += "%02X " % ord(ch)
+		i += 1
+	print(line)
+
+
+def dump_hex_byte_string_diff(addr, a, b, bytes_per_line=16):
+	i = 0
+	line = ''
+	a_len = len(a)
+	b_len = len(b)
+	if a_len < b_len:
+		max_len = b_len
+	else:
+		max_len = a_len
+	tty_colors = TerminalColors(True)
+	for i in range(max_len):
+		ch = None
+		if i < a_len:
+			ch_a = a[i]
+			ch = ch_a
+		else:
+			ch_a = None
+		if i < b_len:
+			ch_b = b[i]
+			if not ch:
+				ch = ch_b
+		else:
+			ch_b = None
+		mismatch = ch_a != ch_b
+		if (i % bytes_per_line) == 0:
+			if line:
+				print(line)
+			line = '%#8.8x: ' % (addr + i)
+		if mismatch:
+			line += RED
+		line += "%02X " % ord(ch)
+		if mismatch:
+			line += RST
+		i += 1
+
+	print(line)
+
+class FileExtract:
+	'''Decode binary data from a file'''
+
+	def __init__(self, f, b='='):
+		'''Initialize with an open binary file and optional byte order'''
+
+		self.file = f
+		self.byte_order = b
+		self.offsets = list()
+
+	def set_byte_order(self, b):
+		'''Set the byte order, valid values are "big", "little", "swap", "native", "<", ">", "@", "="'''
+		if b == 'big':
+			self.byte_order = '>'
+		elif b == 'little':
+			self.byte_order = '<'
+		elif b == 'swap':
+			# swap what ever the current byte order is
+			self.byte_order = swap_unpack_char()
+		elif b == 'native':
+			self.byte_order = '='
+		elif b == '<' or b == '>' or b == '@' or b == '=':
+			self.byte_order = b
+		else:
+			print("error: invalid byte order specified: '%s'" % b)
+
+	def is_in_memory(self):
+		return False
+
+	def seek(self, offset, whence=0):
+		if self.file:
+			return self.file.seek(offset, whence)
+		raise ValueError
+
+	def tell(self):
+		if self.file:
+			return self.file.tell()
+		raise ValueError
+
+	def read_size(self, byte_size):
+		s = self.file.read(byte_size)
+		if len(s) != byte_size:
+			return None
+		return s
+
+	def push_offset_and_seek(self, offset):
+		'''Push the current file offset and seek to "offset"'''
+		self.offsets.append(self.file.tell())
+		self.file.seek(offset, 0)
+
+	def pop_offset_and_seek(self):
+		'''Pop a previously pushed file offset, or do nothing if there were no previously pushed offsets'''
+		if len(self.offsets) > 0:
+			self.file.seek(self.offsets.pop())
+
+	def get_sint8(self, fail_value=0):
+		'''Extract a single int8_t from the binary file at the current file position, returns a single integer'''
+		s = self.read_size(1)
+		if s:
+			v, = struct.unpack(self.byte_order + 'b', s)
+			return v
+		else:
+			return fail_value
+
+	def get_uint8(self, fail_value=0):
+		'''Extract a single uint8_t from the binary file at the current file position, returns a single integer'''
+		s = self.read_size(1)
+		if s:
+			v, = struct.unpack(self.byte_order + 'B', s)
+			return v
+		else:
+			return fail_value
+
+	def get_sint16(self, fail_value=0):
+		'''Extract a single int16_t from the binary file at the current file position, returns a single integer'''
+		s = self.read_size(2)
+		if s:
+			v, = struct.unpack(self.byte_order + 'h', s)
+			return v
+		else:
+			return fail_value
+
+	def get_uint16(self, fail_value=0):
+		'''Extract a single uint16_t from the binary file at the current file position, returns a single integer'''
+		s = self.read_size(2)
+		if s:
+			v, = struct.unpack(self.byte_order + 'H', s)
+			return v
+		else:
+			return fail_value
+
+	def get_sint32(self, fail_value=0):
+		'''Extract a single int32_t from the binary file at the current file position, returns a single integer'''
+		s = self.read_size(4)
+		if s:
+			v, = struct.unpack(self.byte_order + 'i', s)
+			return v
+		else:
+			return fail_value
+
+	def get_uint32(self, fail_value=0):
+		'''Extract a single uint32_t from the binary file at the current file position, returns a single integer'''
+		s = self.read_size(4)
+		if s:
+			v, = struct.unpack(self.byte_order + 'I', s)
+			return v
+		else:
+			return fail_value
+
+	def get_sint64(self, fail_value=0):
+		'''Extract a single int64_t from the binary file at the current file position, returns a single integer'''
+		s = self.read_size(8)
+		if s:
+			v, = struct.unpack(self.byte_order + 'q', s)
+			return v
+		else:
+			return fail_value
+
+	def get_uint64(self, fail_value=0):
+		'''Extract a single uint64_t from the binary file at the current file position, returns a single integer'''
+		s = self.read_size(8)
+		if s:
+			v, = struct.unpack(self.byte_order + 'Q', s)
+			return v
+		else:
+			return fail_value
+
+	def get_fixed_length_c_string(
+			self,
+			n,
+			fail_value='',
+			isprint_only_with_space_padding=False):
+		'''Extract a single fixed length C string from the binary file at the current file position, returns a single C string'''
+		s = self.read_size(n)
+		if s:
+			cstr, = struct.unpack(self.byte_order + ("%i" % n) + 's', s)
+			# Strip trialing NULLs
+			cstr = cstr.decode()
+			cstr = cstr.strip("\0")
+			if isprint_only_with_space_padding:
+				for c in cstr:
+					if c in string.printable or ord(c) == 0:
+						continue
+					return fail_value
+			return cstr
+		else:
+			return fail_value
+
+	def get_c_string(self):
+		'''Extract a single NULL terminated C string from the binary file at the current file position, returns a single C string'''
+		cstr = ''
+		byte = self.get_uint8()
+		while byte != 0:
+			cstr += "%c" % byte
+			byte = self.get_uint8()
+		return cstr
+
+	def get_n_sint8(self, n, fail_value=0):
+		'''Extract "n" int8_t integers from the binary file at the current file position, returns a list of integers'''
+		s = self.read_size(n)
+		if s:
+			return struct.unpack(self.byte_order + ("%u" % n) + 'b', s)
+		else:
+			return (fail_value,) * n
+
+	def get_n_uint8(self, n, fail_value=0):
+		'''Extract "n" uint8_t integers from the binary file at the current file position, returns a list of integers'''
+		s = self.read_size(n)
+		if s:
+			return struct.unpack(self.byte_order + ("%u" % n) + 'B', s)
+		else:
+			return (fail_value,) * n
+
+	def get_n_sint16(self, n, fail_value=0):
+		'''Extract "n" int16_t integers from the binary file at the current file position, returns a list of integers'''
+		s = self.read_size(2 * n)
+		if s:
+			return struct.unpack(self.byte_order + ("%u" % n) + 'h', s)
+		else:
+			return (fail_value,) * n
+
+	def get_n_uint16(self, n, fail_value=0):
+		'''Extract "n" uint16_t integers from the binary file at the current file position, returns a list of integers'''
+		s = self.read_size(2 * n)
+		if s:
+			return struct.unpack(self.byte_order + ("%u" % n) + 'H', s)
+		else:
+			return (fail_value,) * n
+
+	def get_n_sint32(self, n, fail_value=0):
+		'''Extract "n" int32_t integers from the binary file at the current file position, returns a list of integers'''
+		s = self.read_size(4 * n)
+		if s:
+			return struct.unpack(self.byte_order + ("%u" % n) + 'i', s)
+		else:
+			return (fail_value,) * n
+
+	def get_n_uint32(self, n, fail_value=0):
+		'''Extract "n" uint32_t integers from the binary file at the current file position, returns a list of integers'''
+		s = self.read_size(4 * n)
+		if s:
+			return struct.unpack(self.byte_order + ("%u" % n) + 'I', s)
+		else:
+			return (fail_value,) * n
+
+	def get_n_sint64(self, n, fail_value=0):
+		'''Extract "n" int64_t integers from the binary file at the current file position, returns a list of integers'''
+		s = self.read_size(8 * n)
+		if s:
+			return struct.unpack(self.byte_order + ("%u" % n) + 'q', s)
+		else:
+			return (fail_value,) * n
+
+	def get_n_uint64(self, n, fail_value=0):
+		'''Extract "n" uint64_t integers from the binary file at the current file position, returns a list of integers'''
+		s = self.read_size(8 * n)
+		if s:
+			return struct.unpack(self.byte_order + ("%u" % n) + 'Q', s)
+		else:
+			return (fail_value,) * n
+
+
+class LookupDictionary(dict):
+	"""
+	a dictionary which can lookup value by key, or keys by value
+	"""
+
+	def __init__(self, items=[]):
+		"""items can be a list of pair_lists or a dictionary"""
+		dict.__init__(self, items)
+
+	def get_keys_for_value(self, value, fail_value=None):
+		"""find the key(s) as a list given a value"""
+		list_result = [item[0] for item in self.items() if item[1] == value]
+		if len(list_result) > 0:
+			return list_result
+		return fail_value
+
+	def get_first_key_for_value(self, value, fail_value=None):
+		"""return the first key of this dictionary given the value"""
+		list_result = [item[0] for item in self.items() if item[1] == value]
+		if len(list_result) > 0:
+			return list_result[0]
+		return fail_value
+
+	def get_value(self, key, fail_value=None):
+		"""find the value given a key"""
+		if key in self:
+			return self[key]
+		return fail_value
+
+
+class Enum(LookupDictionary):
+
+	def __init__(self, initial_value=0, items=[]):
+		"""items can be a list of pair_lists or a dictionary"""
+		LookupDictionary.__init__(self, items)
+		self.value = initial_value
+
+	def set_value(self, v):
+		v_typename = typeof(v).__name__
+		if v_typename == 'str':
+			if str in self:
+				v = self[v]
+			else:
+				v = 0
+		else:
+			self.value = v
+
+	def get_enum_value(self):
+		return self.value
+
+	def get_enum_name(self):
+		return self.__str__()
+
+	def __str__(self):
+		s = self.get_first_key_for_value(self.value, None)
+		if s is None:
+			s = "%#8.8x" % self.value
+		return s
+
+	def __repr__(self):
+		return self.__str__()
+
+#################################################################################
 ############################ Mach-O Parser ######################################
 #################################################################################
-class MACH_HEADER(Structure):
-	_fields_ = [
-				("magic",           c_uint),
-				("cputype",         c_uint),
-				("cpusubtype",      c_uint),
-				("filetype",        c_uint),
-				("ncmds",           c_uint),
-				("sizeofcmds",      c_uint),
-				("flags",           c_uint)
-			   ]
-
-class LOAD_COMMAND(Structure):
-	_fields_ = [
-				("cmd",             c_uint),
-				("cmdsize",         c_uint)
-			   ]
-
-class SEGMENT_COMMAND(Structure):
-	_fields_ = [
-				("cmd",             c_uint),
-				("cmdsize",         c_uint),
-				("segname",         c_char * 16),
-				("vmaddr",          c_uint),
-				("vmsize",          c_uint),
-				("fileoff",         c_uint),
-				("filesize",        c_uint),
-				("maxprot",         c_uint),
-				("initprot",        c_uint),
-				("nsects",          c_uint),
-				("flags",           c_uint)
-			   ]
-
-class SEGMENT_COMMAND64(Structure):
-	_fields_ = [
-				("cmd",             c_uint),
-				("cmdsize",         c_uint),
-				("segname",         c_ubyte * 16),
-				("vmaddr",          c_ulonglong),
-				("vmsize",          c_ulonglong),
-				("fileoff",         c_ulonglong),
-				("filesize",        c_ulonglong),
-				("maxprot",         c_uint),
-				("initprot",        c_uint),
-				("nsects",          c_uint),
-				("flags",           c_uint)
-			   ]
-
-class SECTION(Structure):
-	_fields_ = [
-				("sectname",        c_char * 16),  
-				("segname",         c_char * 16),  
-				("addr",            c_uint),  
-				("size",            c_uint),  
-				("offset",          c_uint),  
-				("align",           c_uint),  
-				("reloff",          c_uint),  
-				("nreloc",          c_uint),  
-				("flags",           c_uint),  
-				("reserved1",       c_uint),  
-				("reserved2",       c_uint)  
-			   ]
-	
-class SECTION64(Structure):
-	_fields_ = [
-				("sectname",        c_char * 16),  
-				("segname",         c_char * 16),  
-				("addr",            c_ulonglong),  
-				("size",            c_ulonglong),  
-				("offset",          c_uint),  
-				("align",           c_uint),  
-				("reloff",          c_uint),  
-				("nreloc",          c_uint),  
-				("flags",           c_uint),  
-				("reserved1",       c_uint),  
-				("reserved2",       c_uint)  
-			   ]
-
-
-class MACHOFlags:
-	CPU_TYPE_I386               = 0x7
-	CPU_TYPE_X86_64             = (CPU_TYPE_I386 | 0x1000000)
-	CPU_TYPE_MIPS               = 0x8
-	CPU_TYPE_ARM                = 12
-	CPU_TYPE_SPARC              = 14
-	CPU_TYPE_POWERPC            = 18
-	CPU_TYPE_POWERPC64          = (CPU_TYPE_POWERPC | 0x1000000)
-	LC_SEGMENT                  = 0x1
-	LC_SEGMENT_64               = 0x19
-	LC_ENCRYPTION_INFO			= 0x21
-	LC_ENCRYPTION_INFO_64		= 0x2C
-	LC_CODE_SIGNATURE			= 0x1d
-	LC_DYLIB_CODE_SIGN_DRS		= 0x2B
-	S_ATTR_SOME_INSTRUCTIONS    = 0x00000400
-	S_ATTR_PURE_INSTRUCTIONS    = 0x80000000
-
-
-class FAT_HEADER(BigEndianStructure):
-    _fields_ = [
-                ("magic",           c_uint),
-                ("nfat_arch",       c_uint)
-               ]
-
-class FAT_ARC(BigEndianStructure):
-    _fields_ = [
-                ("cputype",         c_uint),
-                ("cpusubtype",      c_uint),
-                ("offset",          c_uint),
-                ("size",            c_uint),
-                ("align",           c_uint)
-               ]
-
-MH_PIE 						= 0x0020_0000
-MH_NO_HEAP_EXECUTION		= 0x0100_0000
-MH_ALLOW_STACK_EXECUTION 	= 0x0002_0000
-
-class MachoFile:
-	def __init__(self, macho_data, path, debugger):
-		self.__executable 	= path
-		self.__binary 		= macho_data
-		self.__debugger		= debugger
-		
-		self.__machHeader   = None
-		self.__rawLoadCmd   = None
-		self.is_encrypted	= False
-		self.__sections_l   = []
-
-		self.__setHeader()
-		self.__setLoadCmd()
-
-		dlog(f"Parsing {cpu_to_string(self.__machHeader.cputype)} Mach-O")
-
-		macho_stat 	= os.stat(self.__executable)
-		self.is_uid 	= stat.S_ISUID & macho_stat.st_mode
-		self.is_gid 	= stat.S_ISGID & macho_stat.st_mode
-
-		objc_release, __stack_chk_guard, __stack_chk_fail = self.has_arc_and_strong_stack()
-
-		print(f"ARC	         : {objc_release}")
-		print(f"PIE	         : {self.has_pie()}")
-		print(f"Stack Canary	 : {__stack_chk_guard and __stack_chk_fail}")
-		print(f"Encrypted	 : {self.is_encrypted}")
-		print(f"NX Heap		 : {self.has_nx_heap()}")
-		print(f"NX Stack 	 : {self.has_nx_stack()}")
-		print(f"Restricted 	 : {self.has_restricted()}")
-
-	def get_entropy(self, b):
-		"""Calculate byte entropy for given bytes."""
-		byte_counts = Counter()
-
-		entropy = 0
-
-		for i in b:
-			byte_counts[i] += 1
-
-		total = float(sum(byte_counts.values()))
-
-		for count in byte_counts.values():
-			p = float(count) / total
-			entropy -= p * log(p, 256)
-
-		return entropy	
-
-	def get_section_entropy(self, section):
-		"""Get Entropy of a given section"""
-		pass
-
-	def __setHeader(self):
-		self.__machHeader = MACH_HEADER.from_buffer_copy(self.__binary)
-		self.__rawLoadCmd   = self.__binary[32:32+self.__machHeader.sizeofcmds]
-
-	def __setLoadCmd(self):
-		base = self.__rawLoadCmd
-		for i in range(self.__machHeader.ncmds):
-			command = LOAD_COMMAND.from_buffer_copy(base)
-
-			if command.cmd == MACHOFlags.LC_SEGMENT:
-				segment = SEGMENT_COMMAND.from_buffer_copy(base)
-				self.__setSections(segment.nsects, base[56:], 32)
-
-			elif command.cmd == MACHOFlags.LC_SEGMENT_64:
-				segment = SEGMENT_COMMAND64.from_buffer_copy(base)
-				self.__setSections(segment.nsects, base[72:], 64)
-
-			elif command.cmd == MACHOFlags.LC_ENCRYPTION_INFO:
-				cmd, cmdsize, cryptoff, cryptsize, cryptid = struct.unpack('<IIIII', buf)
-				self.is_encrypted = bool(cryptid)
-			
-			elif command.cmd == MACHOFlags.LC_ENCRYPTION_INFO_64:
-				cmd, cmdsize, cryptoff, cryptsize, cryptid, padding = struct.unpack('<IIIIII', buf)
-				self.is_encrypted = bool(cryptid)
-
-			base = base[command.cmdsize:]
-
-	def __setSections(self, sectionsNumber, base, sizeHeader):
-		for i in range(sectionsNumber):
-			if sizeHeader == 32:
-				section = SECTION.from_buffer_copy(base)
-				base = base[68:]
-				self.__sections_l += [section]
-			elif sizeHeader == 64:
-				section = SECTION64.from_buffer_copy(base)
-				base = base[80:]
-				self.__sections_l += [section]
-
-	def getEntryPoint(self):
-		
-		for section in self.__sections_l:
-			if section.sectname[0:6] == "__text":
-				return section.addr
-
-	def getExecSections(self):
-		ret = []
-		for section in self.__sections_l:
-			if section.flags & MACHOFlags.S_ATTR_SOME_INSTRUCTIONS or section.flags & MACHOFlags.S_ATTR_PURE_INSTRUCTIONS:
-				ret +=  [{
-							"name"    : section.sectname,
-							"offset"  : section.offset,
-							"size"    : section.size,
-							"vaddr"   : section.addr,
-							"opcodes" : bytes(self.__binary[section.offset:section.offset+section.size])
-						}]
-		return ret
-
-	def getDataSections(self):
-		ret = []
-		for section in self.__sections_l:
-			if not section.flags & MACHOFlags.S_ATTR_SOME_INSTRUCTIONS and not section.flags & MACHOFlags.S_ATTR_PURE_INSTRUCTIONS:
-				ret +=  [{
-							"name"    : section.sectname,
-							"offset"  : section.offset,
-							"size"    : section.size,
-							"vaddr"   : section.addr,
-							"opcodes" : str(self.__binary[section.offset:section.offset+section.size])
-						}]
-		return ret
-
-	def has_pie(self):
-		return bool(self.__machHeader.flags & MH_PIE)
-
-	def has_nx_heap(self):
-		#do we need to check this??? I'm gonna return TRUE cause of W^X
-		return True if self.__machHeader.flags & MH_NO_HEAP_EXECUTION else True
-	
-	def has_nx_stack(self):
-		return False if self.__machHeader.flags & MH_ALLOW_STACK_EXECUTION else True
-	
-	def has_restricted(self):
-		#3 cases restrictedBySetGUid, restrictedBySegment, restrictedByEntitlements
-		codesign = runShellCommand(f"codesign -dvvvv '{self.__executable}'").stderr.decode() #stderr ( :| ) ???
-		
-		if codesign and "Authority=Apple Root CA" in codesign:
-			authority = ""
-			for i in codesign.splitlines():
-				if "Authority" in i:
-					return f"True ({i})"
-
-		#restrictedBySetGUid
-		if self.is_uid or self.is_gid:
-			msg = "is_uid" if self.is_uid else "gid"
-			return f"True ({msg})"
-
-		#restrictedBySegment
-		for section in self.__sections_l:
-			if section.sectname.decode()=="__restrict":
-				return "True (__restrict)"
-
-		return False
-
-	def has_arc_and_strong_stack(self):
-		objc_release	  = False
-		__stack_chk_guard = False
-		__stack_chk_fail  = False
-
-		selected_target = self.__debugger.GetSelectedTarget()
-
-		target = self.__debugger.CreateTarget(self.__executable)
-		for module in target.modules:
-			if fnmatch.fnmatch(module.file.fullpath.lower(), self.__executable.lower()):
-
-				for i in module.symbols:
-					if i.name == "objc_release":
-						objc_release =  True
-					if i.name == "__stack_chk_guard":
-						__stack_chk_guard =  True
-					if i.name == "__stack_chk_fail":
-						__stack_chk_fail =  True
-
-		self.__debugger.DeleteTarget(target)
-		self.__debugger.SetSelectedTarget(selected_target)	# reset back to previously selected target
-
-		return objc_release, __stack_chk_guard, __stack_chk_fail
-
-class MachOBinary:
-
-	MH_MAGIC_64 = 0xfeedfacf
-	MH_CIGAM_64 = 0xcffaedfe
-	FAT_MAGIC	= 0xcafebabe
-	FAT_CIGAM	= 0xbebafeca
-
-	def __init__(self, macho, debugger):
-		self.__executable = macho
-		self.__debugger   = debugger
-
-		if not os.path.isfile(self.__executable):
-			errlog(f"{macho} file not found")
-			return
-
-		with open(self.__executable, "rb") as f:
-			self.macho_data = f.read()
-
-		self.parse()
-
-	def get_magic(self, data):
-		magic = struct.unpack("<L", data[:4])[0]
-		return magic
-
-	def is_universal(self, magic):
-		"""Check if given file is a Universal Mach-o"""
-		if magic in [self.FAT_MAGIC, self.FAT_CIGAM]:
-			return True
-
-		return False
-
-	def is_supported(self, magic):
-		if magic in [self.MH_CIGAM_64, self.MH_MAGIC_64]:
-			return True
-		
-		return False
-
-	def parse(self):
-		magic = self.get_magic(self.macho_data)
-
-		if self.is_universal(magic):
-			dlog("Got a fat binary")
-
-			parse_only_host = True
-
-			option 	=	input(f"{RED}Choose only the host arch: {get_host_machine()}? y/n: {RST}")
-
-			if option == "n":
-				parse_only_host = False
-			
-			self.__machoBinaries = []
-
-			offset = 8
-			self.__fatHeader    = FAT_HEADER.from_buffer_copy(self.macho_data)
-
-			for i in range(self.__fatHeader.nfat_arch):
-				header = FAT_ARC.from_buffer_copy(self.macho_data[offset:])
-				rawBinary = self.macho_data[header.offset:header.offset+header.size]
-				macho_header = MACH_HEADER.from_buffer_copy(rawBinary)
-
-				if parse_only_host:
-					if header.cputype==get_host_arch():
-						return self.parse_macho(rawBinary)
-				
-				self.__machoBinaries.append(rawBinary)
-
-				offset += sizeof(header)
-
-			for i in range(len(self.__machoBinaries)):
-				self.parse_macho(self.__machoBinaries[i])
 
+# Mach header "magic" constants
+MH_MAGIC = 0xfeedface
+MH_CIGAM = 0xcefaedfe
+MH_MAGIC_64 = 0xfeedfacf
+MH_CIGAM_64 = 0xcffaedfe
+FAT_MAGIC = 0xcafebabe
+FAT_CIGAM = 0xbebafeca
+
+# Mach haeder "filetype" constants
+MH_OBJECT = 0x00000001
+MH_EXECUTE = 0x00000002
+MH_FVMLIB = 0x00000003
+MH_CORE = 0x00000004
+MH_PRELOAD = 0x00000005
+MH_DYLIB = 0x00000006
+MH_DYLINKER = 0x00000007
+MH_BUNDLE = 0x00000008
+MH_DYLIB_STUB = 0x00000009
+MH_DSYM = 0x0000000a
+MH_KEXT_BUNDLE = 0x0000000b
+
+# Mach haeder "flag" constant bits
+MH_NOUNDEFS = 0x00000001
+MH_INCRLINK = 0x00000002
+MH_DYLDLINK = 0x00000004
+MH_BINDATLOAD = 0x00000008
+MH_PREBOUND = 0x00000010
+MH_SPLIT_SEGS = 0x00000020
+MH_LAZY_INIT = 0x00000040
+MH_TWOLEVEL = 0x00000080
+MH_FORCE_FLAT = 0x00000100
+MH_NOMULTIDEFS = 0x00000200
+MH_NOFIXPREBINDING = 0x00000400
+MH_PREBINDABLE = 0x00000800
+MH_ALLMODSBOUND = 0x00001000
+MH_SUBSECTIONS_VIA_SYMBOLS = 0x00002000
+MH_CANONICAL = 0x00004000
+MH_WEAK_DEFINES = 0x00008000
+MH_BINDS_TO_WEAK = 0x00010000
+MH_ALLOW_STACK_EXECUTION = 0x00020000
+MH_ROOT_SAFE = 0x00040000
+MH_SETUID_SAFE = 0x00080000
+MH_NO_REEXPORTED_DYLIBS = 0x00100000
+MH_PIE = 0x00200000
+MH_DEAD_STRIPPABLE_DYLIB = 0x00400000
+MH_HAS_TLV_DESCRIPTORS = 0x00800000
+MH_NO_HEAP_EXECUTION = 0x01000000
+
+# Mach load command constants
+LC_REQ_DYLD = 0x80000000
+LC_SEGMENT = 0x00000001
+LC_SYMTAB = 0x00000002
+LC_SYMSEG = 0x00000003
+LC_THREAD = 0x00000004
+LC_UNIXTHREAD = 0x00000005
+LC_LOADFVMLIB = 0x00000006
+LC_IDFVMLIB = 0x00000007
+LC_IDENT = 0x00000008
+LC_FVMFILE = 0x00000009
+LC_PREPAGE = 0x0000000a
+LC_DYSYMTAB = 0x0000000b
+LC_LOAD_DYLIB = 0x0000000c
+LC_ID_DYLIB = 0x0000000d
+LC_LOAD_DYLINKER = 0x0000000e
+LC_ID_DYLINKER = 0x0000000f
+LC_PREBOUND_DYLIB = 0x00000010
+LC_ROUTINES = 0x00000011
+LC_SUB_FRAMEWORK = 0x00000012
+LC_SUB_UMBRELLA = 0x00000013
+LC_SUB_CLIENT = 0x00000014
+LC_SUB_LIBRARY = 0x00000015
+LC_TWOLEVEL_HINTS = 0x00000016
+LC_PREBIND_CKSUM = 0x00000017
+LC_LOAD_WEAK_DYLIB = 0x00000018 | LC_REQ_DYLD
+LC_SEGMENT_64 = 0x00000019
+LC_ROUTINES_64 = 0x0000001a
+LC_UUID = 0x0000001b
+LC_RPATH = 0x0000001c | LC_REQ_DYLD
+LC_CODE_SIGNATURE = 0x0000001d
+LC_SEGMENT_SPLIT_INFO = 0x0000001e
+LC_REEXPORT_DYLIB = 0x0000001f | LC_REQ_DYLD
+LC_LAZY_LOAD_DYLIB = 0x00000020
+LC_ENCRYPTION_INFO = 0x00000021
+LC_DYLD_INFO = 0x00000022
+LC_DYLD_INFO_ONLY = 0x00000022 | LC_REQ_DYLD
+LC_LOAD_UPWARD_DYLIB = 0x00000023 | LC_REQ_DYLD
+LC_VERSION_MIN_MACOSX = 0x00000024
+LC_VERSION_MIN_IPHONEOS = 0x00000025
+LC_FUNCTION_STARTS = 0x00000026
+LC_DYLD_ENVIRONMENT = 0x00000027
+
+# Mach CPU constants
+CPU_ARCH_MASK = 0xff000000
+CPU_ARCH_ABI64 = 0x01000000
+CPU_TYPE_ANY = 0xffffffff
+CPU_TYPE_VAX = 1
+CPU_TYPE_MC680x0 = 6
+CPU_TYPE_I386 = 7
+CPU_TYPE_X86_64 = CPU_TYPE_I386 | CPU_ARCH_ABI64
+
+CPU_TYPE_ARM = 12
+CPU_TYPE_ARM64	= CPU_TYPE_ARM | CPU_ARCH_ABI64
+
+
+# VM protection constants
+VM_PROT_READ = 1
+VM_PROT_WRITE = 2
+VM_PROT_EXECUTE = 4
+
+# VM protection constants
+N_STAB = 0xe0
+N_PEXT = 0x10
+N_TYPE = 0x0e
+N_EXT = 0x01
+
+# Values for nlist N_TYPE bits of the "Mach.NList.type" field.
+N_UNDF = 0x0
+N_ABS = 0x2
+N_SECT = 0xe
+N_PBUD = 0xc
+N_INDR = 0xa
+
+# Section indexes for the "Mach.NList.sect_idx" fields
+NO_SECT = 0
+MAX_SECT = 255
+
+# Stab defines
+N_GSYM = 0x20
+N_FNAME = 0x22
+N_FUN = 0x24
+N_STSYM = 0x26
+N_LCSYM = 0x28
+N_BNSYM = 0x2e
+N_OPT = 0x3c
+N_RSYM = 0x40
+N_SLINE = 0x44
+N_ENSYM = 0x4e
+N_SSYM = 0x60
+N_SO = 0x64
+N_OSO = 0x66
+N_LSYM = 0x80
+N_BINCL = 0x82
+N_SOL = 0x84
+N_PARAMS = 0x86
+N_VERSION = 0x88
+N_OLEVEL = 0x8A
+N_PSYM = 0xa0
+N_EINCL = 0xa2
+N_ENTRY = 0xa4
+N_LBRAC = 0xc0
+N_EXCL = 0xc2
+N_RBRAC = 0xe0
+N_BCOMM = 0xe2
+N_ECOMM = 0xe4
+N_ECOML = 0xe8
+N_LENG = 0xfe
+
+vm_prot_names = ['---', 'r--', '-w-', 'rw-', '--x', 'r-x', '-wx', 'rwx']
+
+
+class Mach:
+	"""Class that does everything mach-o related"""
+
+	class Arch:
+		"""Class that implements mach-o architectures"""
+
+		def __init__(self, c=0, s=0):
+			self.cpu = c
+			self.sub = s
+
+		def set_cpu_type(self, c):
+			self.cpu = c
+
+		def set_cpu_subtype(self, s):
+			self.sub = s
+
+		def set_arch(self, c, s):
+			self.cpu = c
+			self.sub = s
+
+		def is_64_bit(self):
+			return (self.cpu & CPU_ARCH_ABI64) != 0
+
+		cpu_infos = [
+			["arm64", CPU_TYPE_ARM64, 2],
+			["x86_64", CPU_TYPE_X86_64, 3],
+			["x86_64", CPU_TYPE_X86_64, CPU_TYPE_ANY],
+		]
+
+		def __str__(self):
+			for info in self.cpu_infos:
+				if self.cpu == info[1] and (self.sub & 0x00ffffff) == info[2]:
+					return info[0]
+			return "{0:x}.{1:x}".format(self.cpu, self.sub)
+
+	class Magic(Enum):
+
+		enum = {
+			'MH_MAGIC': MH_MAGIC,
+			'MH_CIGAM': MH_CIGAM,
+			'MH_MAGIC_64': MH_MAGIC_64,
+			'MH_CIGAM_64': MH_CIGAM_64,
+			'FAT_MAGIC': FAT_MAGIC,
+			'FAT_CIGAM': FAT_CIGAM
+		}
+
+		def __init__(self, initial_value=0):
+			Enum.__init__(self, initial_value, self.enum)
+
+		def is_skinny_mach_file(self):
+			return self.value == MH_MAGIC or self.value == MH_CIGAM or self.value == MH_MAGIC_64 or self.value == MH_CIGAM_64
+
+		def is_universal_mach_file(self):
+			return self.value == FAT_MAGIC or self.value == FAT_CIGAM
+
+		def unpack(self, data):
+			data.set_byte_order('native')
+			self.value = data.get_uint32()
+
+		def get_byte_order(self):
+			if self.value == MH_CIGAM or self.value == MH_CIGAM_64 or self.value == FAT_CIGAM:
+				return swap_unpack_char()
+			else:
+				return '='
+
+		def is_64_bit(self):
+			return self.value == MH_MAGIC_64 or self.value == MH_CIGAM_64
+
+	def __init__(self, debugger):
+		self.magic = Mach.Magic()
+		self.content = None
+		self.path = None
+		self.debugger = debugger
+
+	def extract(self, path, extractor):
+		self.path = path
+		self.unpack(extractor)
+
+	def parse(self, path):
+		self.path = path
+		try:
+			f = open(self.path, 'rb')
+			file_extractor = FileExtract(f, '=')
+			self.unpack(file_extractor)
+			# f.close()
+		except IOError as xxx_todo_changeme:
+			(errno, strerror) = xxx_todo_changeme.args
+			print("I/O error({0}): {1}".format(errno, strerror))
+		except ValueError:
+			print("Could not convert data to an integer.")
+		except:
+			print("Unexpected error:", sys.exc_info()[0])
+			raise
+
+	def compare(self, rhs):
+		self.content.compare(rhs.content)
+
+	def dump(self, options=None):
+		self.content.dump(options)
+
+	def dump_header(self, dump_description=True, options=None):
+		self.content.dump_header(dump_description, options)
+
+	def dump_load_commands(self, dump_description=True, options=None):
+		self.content.dump_load_commands(dump_description, options)
+
+	def dump_sections(self, dump_description=True, options=None):
+		self.content.dump_sections(dump_description, options)
+
+	def dump_section_contents(self, options):
+		self.content.dump_section_contents(options)
+
+	def dump_symtab(self, dump_description=True, options=None):
+		self.content.dump_symtab(dump_description, options)
+
+	def dump_symbol_names_matching_regex(self, regex, file=None):
+		self.content.dump_symbol_names_matching_regex(regex, file)
+
+	def description(self):
+		return self.content.description()
+
+	def unpack(self, data):
+		self.magic.unpack(data)
+		if self.magic.is_skinny_mach_file():
+			self.content = Mach.Skinny(self.path, self.debugger)
+
+		elif self.magic.is_universal_mach_file():
+			self.content = Mach.Universal(self.path, self.debugger)
 		else:
-			dlog("Got a Macho-O binary")
-			self.parse_macho(self.macho_data)
+			self.content = None
 
-	def parse_macho(self, data):
-		magic = self.get_magic(data)
+		if self.content is not None:
+			self.content.unpack(data, self.magic)
+
+	def is_valid(self):
+		return self.content is not None
+
+	class Universal:
+
+		def __init__(self, path, debugger):
+			self.path = path
+			self.type = 'universal'
+			self.file_off = 0
+			self.magic = None
+			self.nfat_arch = 0
+			self.archs = list()
+			self.debugger = debugger
+
+		def description(self):
+			s = '%#8.8x: %s (' % (self.file_off, self.path)
+			archs_string = ''
+			for arch in self.archs:
+				if len(archs_string):
+					archs_string += ', '
+				archs_string += '%s' % arch.arch
+			s += archs_string
+			s += ')'
+			return s
+
+		def unpack(self, data, magic=None):
+			self.file_off = data.tell()
+			if magic is None:
+				self.magic = Mach.Magic()
+				self.magic.unpack(data)
+			else:
+				self.magic = magic
+				self.file_off = self.file_off - 4
+			# Universal headers are always in big endian
+			data.set_byte_order('big')
+			self.nfat_arch = data.get_uint32()
+
+			for i in range(self.nfat_arch):
+				self.archs.append(Mach.Universal.ArchInfo())
+				self.archs[i].unpack(data)
+
+			for i in range(self.nfat_arch):
+				self.archs[i].mach = Mach.Skinny(self.path, self.debugger)
+				data.seek(self.archs[i].offset, 0)
+				skinny_magic = Mach.Magic()
+				skinny_magic.unpack(data)
+				self.archs[i].mach.unpack(data, skinny_magic)
+
+		def compare(self, rhs):
+			print('error: comparing two universal files is not supported yet')
+			return False
+
+		def dump(self, options):
+			if options.dump_header:
+				print()
+				print("Universal Mach File: magic = %s, nfat_arch = %u" % (self.magic, self.nfat_arch))
+				print()
+			if self.nfat_arch > 0:
+				if options.dump_header:
+					self.archs[0].dump_header(True, options)
+					for i in range(self.nfat_arch):
+						self.archs[i].dump_flat(options)
+				if options.dump_header:
+					print()
+				for i in range(self.nfat_arch):
+					self.archs[i].mach.dump(options)
+
+		def dump_header(self, dump_description=True, options=None):
+			if dump_description:
+				print(self.description())
+			for i in range(self.nfat_arch):
+				self.archs[i].mach.dump_header(True, options)
+				print()
+
+		def dump_load_commands(self, dump_description=True, options=None):
+			if dump_description:
+				print(self.description())
+			for i in range(self.nfat_arch):
+				self.archs[i].mach.dump_load_commands(True, options)
+				print()
+
+		def dump_sections(self, dump_description=True, options=None):
+			if dump_description:
+				print(self.description())
+			for i in range(self.nfat_arch):
+				self.archs[i].mach.dump_sections(True, options)
+				print()
+
+		def dump_section_contents(self, options):
+			for i in range(self.nfat_arch):
+				self.archs[i].mach.dump_section_contents(options)
+				print()
+
+		def dump_symtab(self, dump_description=True, options=None):
+			if dump_description:
+				print(self.description())
+			for i in range(self.nfat_arch):
+				self.archs[i].mach.dump_symtab(True, options)
+				print()
+
+		def dump_symbol_names_matching_regex(self, regex, file=None):
+			for i in range(self.nfat_arch):
+				self.archs[i].mach.dump_symbol_names_matching_regex(
+					regex, file)
+
+		def checksec(self):
+			for i in range(self.nfat_arch):
+				if self.archs[i].mach.arch.__str__() == get_host_machine():
+					self.archs[i].mach.checksec()
+
+		class ArchInfo:
+
+			def __init__(self):
+				self.arch = Mach.Arch(0, 0)
+				self.offset = 0
+				self.size = 0
+				self.align = 0
+				self.mach = None
+
+			def unpack(self, data):
+				# Universal headers are always in big endian
+				data.set_byte_order('big')
+				self.arch.cpu, self.arch.sub, self.offset, self.size, self.align = data.get_n_uint32(
+					5)
+
+			def dump_header(self, dump_description=True, options=None):
+				if options.verbose:
+					print("CPU        SUBTYPE    OFFSET     SIZE       ALIGN")
+					print("---------- ---------- ---------- ---------- ----------")
+				else:
+					print("ARCH       FILEOFFSET FILESIZE   ALIGN")
+					print("---------- ---------- ---------- ----------")
+
+			def dump_flat(self, options):
+				if options.verbose:
+					print("%#8.8x %#8.8x %#8.8x %#8.8x %#8.8x" % (self.arch.cpu, self.arch.sub, self.offset, self.size, self.align))
+				else:
+					print("%-10s %#8.8x %#8.8x %#8.8x" % (self.arch, self.offset, self.size, self.align))
+
+			def dump(self):
+				print("   cputype: %#8.8x" % self.arch.cpu)
+				print("cpusubtype: %#8.8x" % self.arch.sub)
+				print("    offset: %#8.8x" % self.offset)
+				print("      size: %#8.8x" % self.size)
+				print("     align: %#8.8x" % self.align)
+
+			def __str__(self):
+				return "Mach.Universal.ArchInfo: %#8.8x %#8.8x %#8.8x %#8.8x %#8.8x" % (
+					self.arch.cpu, self.arch.sub, self.offset, self.size, self.align)
+
+			def __repr__(self):
+				return "Mach.Universal.ArchInfo: %#8.8x %#8.8x %#8.8x %#8.8x %#8.8x" % (
+					self.arch.cpu, self.arch.sub, self.offset, self.size, self.align)
+
+	class Flags:
+
+		def __init__(self, b):
+			self.bits = b
+
+		def __str__(self):
+			s = ''
+			if self.bits & MH_NOUNDEFS:
+				s += 'MH_NOUNDEFS | '
+			if self.bits & MH_INCRLINK:
+				s += 'MH_INCRLINK | '
+			if self.bits & MH_DYLDLINK:
+				s += 'MH_DYLDLINK | '
+			if self.bits & MH_BINDATLOAD:
+				s += 'MH_BINDATLOAD | '
+			if self.bits & MH_PREBOUND:
+				s += 'MH_PREBOUND | '
+			if self.bits & MH_SPLIT_SEGS:
+				s += 'MH_SPLIT_SEGS | '
+			if self.bits & MH_LAZY_INIT:
+				s += 'MH_LAZY_INIT | '
+			if self.bits & MH_TWOLEVEL:
+				s += 'MH_TWOLEVEL | '
+			if self.bits & MH_FORCE_FLAT:
+				s += 'MH_FORCE_FLAT | '
+			if self.bits & MH_NOMULTIDEFS:
+				s += 'MH_NOMULTIDEFS | '
+			if self.bits & MH_NOFIXPREBINDING:
+				s += 'MH_NOFIXPREBINDING | '
+			if self.bits & MH_PREBINDABLE:
+				s += 'MH_PREBINDABLE | '
+			if self.bits & MH_ALLMODSBOUND:
+				s += 'MH_ALLMODSBOUND | '
+			if self.bits & MH_SUBSECTIONS_VIA_SYMBOLS:
+				s += 'MH_SUBSECTIONS_VIA_SYMBOLS | '
+			if self.bits & MH_CANONICAL:
+				s += 'MH_CANONICAL | '
+			if self.bits & MH_WEAK_DEFINES:
+				s += 'MH_WEAK_DEFINES | '
+			if self.bits & MH_BINDS_TO_WEAK:
+				s += 'MH_BINDS_TO_WEAK | '
+			if self.bits & MH_ALLOW_STACK_EXECUTION:
+				s += 'MH_ALLOW_STACK_EXECUTION | '
+			if self.bits & MH_ROOT_SAFE:
+				s += 'MH_ROOT_SAFE | '
+			if self.bits & MH_SETUID_SAFE:
+				s += 'MH_SETUID_SAFE | '
+			if self.bits & MH_NO_REEXPORTED_DYLIBS:
+				s += 'MH_NO_REEXPORTED_DYLIBS | '
+			if self.bits & MH_PIE:
+				s += 'MH_PIE | '
+			if self.bits & MH_DEAD_STRIPPABLE_DYLIB:
+				s += 'MH_DEAD_STRIPPABLE_DYLIB | '
+			if self.bits & MH_HAS_TLV_DESCRIPTORS:
+				s += 'MH_HAS_TLV_DESCRIPTORS | '
+			if self.bits & MH_NO_HEAP_EXECUTION:
+				s += 'MH_NO_HEAP_EXECUTION | '
+			# Strip the trailing " |" if we have any flags
+			if len(s) > 0:
+				s = s[0:-2]
+			return s
+
+	class FileType(Enum):
+
+		enum = {
+			'MH_OBJECT': MH_OBJECT,
+			'MH_EXECUTE': MH_EXECUTE,
+			'MH_FVMLIB': MH_FVMLIB,
+			'MH_CORE': MH_CORE,
+			'MH_PRELOAD': MH_PRELOAD,
+			'MH_DYLIB': MH_DYLIB,
+			'MH_DYLINKER': MH_DYLINKER,
+			'MH_BUNDLE': MH_BUNDLE,
+			'MH_DYLIB_STUB': MH_DYLIB_STUB,
+			'MH_DSYM': MH_DSYM,
+			'MH_KEXT_BUNDLE': MH_KEXT_BUNDLE
+		}
+
+		def __init__(self, initial_value=0):
+			Enum.__init__(self, initial_value, self.enum)
+
+	class Skinny:
+
+		def __init__(self, path, debugger):
+			self.path = path
+			self.type = 'skinny'
+			self.data = None
+			self.file_off = 0
+			self.magic = 0
+			self.arch = Mach.Arch(0, 0)
+			self.filetype = Mach.FileType(0)
+			self.ncmds = 0
+			self.sizeofcmds = 0
+			self.flags = Mach.Flags(0)
+			self.uuid = None
+			self.commands = list()
+			self.segments = list()
+			self.sections = list()
+			self.symbols = list()
+			self.is_encrypted	= False
+			self.debugger		= debugger
+			self.sections.append(Mach.Section())
+
+		def checksec(self):
+			macho_stat 		= os.stat(self.path)
+			nx_heap 		= self.has_nx_heap()
+			self.has_pie	= bool(self.flags.bits & MH_PIE)
+			self.is_uid		= stat.S_ISUID & macho_stat.st_mode
+			self.is_gid		= stat.S_ISGID & macho_stat.st_mode
+
+			objc_release, __stack_chk_guard, __stack_chk_fail = self.has_arc_and_strong_stack()
+
+			print(f"ARC	         : {objc_release}")
+			print(f"PIE	         : {self.has_pie}")
+			print(f"Stack Canary	 : {__stack_chk_guard and __stack_chk_fail}")
+			print(f"Encrypted	 : {self.is_encrypted}")
+			print(f"NX Heap		 : {self.has_nx_heap()}")
+			print(f"NX Stack 	 : {self.has_nx_stack()}")
+			print(f"Restricted 	 : {self.has_restricted()}")
+
+		def has_nx_heap(self):
+			#do we need to check this??? I'm gonna return TRUE cause of W^X
+			return True if self.flags.bits & MH_NO_HEAP_EXECUTION else True
 		
-		if not self.is_supported(magic):
-			warnlog("Only 64-bit macho is supported")
-			return
+		def has_nx_stack(self):
+			return False if self.flags.bits & MH_ALLOW_STACK_EXECUTION else True
 
-		macho = MachoFile(data, self.__executable, self.__debugger)
+		def has_arc_and_strong_stack(self):
+			objc_release	  = False
+			__stack_chk_guard = False
+			__stack_chk_fail  = False
 
+			selected_target = self.debugger.GetSelectedTarget()
 
-class CodeSignature:
-	def __init__(self, signature):
-		self.signature = signature
+			target = self.debugger.CreateTarget(self.path)
+			for module in target.modules:
+				if fnmatch.fnmatch(module.file.fullpath.lower(), self.path.lower()):
 
-	# /* code signing attributes of a process */
-#define	CS_VALID		0x0000001	/* dynamically valid */
-#define CS_ADHOC		0x0000002	/* ad hoc signed */
-#define CS_GET_TASK_ALLOW	0x0000004	/* has get-task-allow entitlement */
-#define CS_INSTALLER		0x0000008	/* has installer entitlement */
+					for i in module.symbols:
+						if i.name == "objc_release":
+							objc_release =  True
+						if i.name == "__stack_chk_guard":
+							__stack_chk_guard =  True
+						if i.name == "__stack_chk_fail":
+							__stack_chk_fail =  True
 
-#define	CS_HARD			0x0000100	/* don't load invalid pages */
-#define	CS_KILL			0x0000200	/* kill process if it becomes invalid */
-#define CS_CHECK_EXPIRATION	0x0000400	/* force expiration checking */
-#define CS_RESTRICT		0x0000800	/* tell dyld to treat restricted */
-#define CS_ENFORCEMENT		0x0001000	/* require enforcement */
-#define CS_REQUIRE_LV		0x0002000	/* require library validation */
-#define CS_ENTITLEMENTS_VALIDATED	0x0004000
+			self.debugger.DeleteTarget(target)
+			self.debugger.SetSelectedTarget(selected_target)	# reset back to previously selected target
+
+			return objc_release, __stack_chk_guard, __stack_chk_fail
+
+		def has_restricted(self):
+			#3 cases restrictedBySetGUid, restrictedBySegment, restrictedByEntitlements
+			codesign = runShellCommand(f"codesign -dvvvv '{self.path}'").stderr.decode() #stderr ( :| ) ???
+			
+			if codesign and "Authority=Apple Root CA" in codesign:
+				authority = ""
+				for i in codesign.splitlines():
+					if "Authority" in i:
+						return f"True ({i})"
+
+			#restrictedBySetGUid
+			if self.is_uid or self.is_gid:
+				msg = "is_uid" if self.is_uid else "gid"
+				return f"True ({msg})"
+
+			#restrictedBySegment
+			for seg in self.segments:
+				if seg.segname.lower()=="__restrict":
+					return "True (__restrict)"
+
+			return False
+			
+		def description(self):
+			return '%#8.8x: %s' % (self.file_off, self.path)
+
+		def unpack(self, data, magic=None):
+			self.data = data
+			self.file_off = data.tell()
+			if magic is None:
+				self.magic = Mach.Magic()
+				self.magic.unpack(data)
+			else:
+				self.magic = magic
+				self.file_off = self.file_off - 4
+			data.set_byte_order(self.magic.get_byte_order())
+			self.arch.cpu, self.arch.sub, self.filetype.value, self.ncmds, self.sizeofcmds, bits = data.get_n_uint32(
+				6)
+			self.flags.bits = bits
+
+			if self.is_64_bit():
+				data.get_uint32()  # Skip reserved word in mach_header_64
+
+			for i in range(0, self.ncmds):
+				lc = self.unpack_load_command(data)
+				self.commands.append(lc)
+
+		def get_data(self):
+			if self.data:
+				self.data.set_byte_order(self.magic.get_byte_order())
+				return self.data
+			return None
+
+		def unpack_load_command(self, data):
+			lc = Mach.LoadCommand()
+			lc.unpack(self, data)
+			lc_command = lc.command.get_enum_value()
+			if (lc_command == LC_SEGMENT or
+					lc_command == LC_SEGMENT_64):
+				lc = Mach.SegmentLoadCommand(lc)
+				lc.unpack(self, data)
+			elif (lc_command == LC_LOAD_DYLIB or
+				  lc_command == LC_ID_DYLIB or
+				  lc_command == LC_LOAD_WEAK_DYLIB or
+				  lc_command == LC_REEXPORT_DYLIB):
+				lc = Mach.DylibLoadCommand(lc)
+				lc.unpack(self, data)
+			elif (lc_command == LC_LOAD_DYLINKER or
+				  lc_command == LC_SUB_FRAMEWORK or
+				  lc_command == LC_SUB_CLIENT or
+				  lc_command == LC_SUB_UMBRELLA or
+				  lc_command == LC_SUB_LIBRARY or
+				  lc_command == LC_ID_DYLINKER or
+				  lc_command == LC_RPATH):
+				lc = Mach.LoadDYLDLoadCommand(lc)
+				lc.unpack(self, data)
+			elif (lc_command == LC_DYLD_INFO_ONLY):
+				lc = Mach.DYLDInfoOnlyLoadCommand(lc)
+				lc.unpack(self, data)
+			elif (lc_command == LC_SYMTAB):
+				lc = Mach.SymtabLoadCommand(lc)
+				lc.unpack(self, data)
+			elif (lc_command == LC_DYSYMTAB):
+				lc = Mach.DYLDSymtabLoadCommand(lc)
+				lc.unpack(self, data)
+			elif (lc_command == LC_UUID):
+				lc = Mach.UUIDLoadCommand(lc)
+				lc.unpack(self, data)
+			elif (lc_command == LC_CODE_SIGNATURE or
+				  lc_command == LC_SEGMENT_SPLIT_INFO or
+				  lc_command == LC_FUNCTION_STARTS):
+				lc = Mach.DataBlobLoadCommand(lc)
+				lc.unpack(self, data)
+			elif (lc_command == LC_UNIXTHREAD):
+				lc = Mach.UnixThreadLoadCommand(lc)
+				lc.unpack(self, data)
+			elif (lc_command == LC_ENCRYPTION_INFO):
+				lc = Mach.EncryptionInfoLoadCommand(lc)
+				lc.unpack(self, data)
+				self.is_encrypted = bool(cryptid)
+				
+			lc.skip(data)
+			return lc
+
+		def compare(self, rhs):
+			print("\nComparing:")
+			print("a) %s %s" % (self.arch, self.path))
+			print("b) %s %s" % (rhs.arch, rhs.path))
+			result = True
+			if self.type == rhs.type:
+				for lhs_section in self.sections[1:]:
+					rhs_section = rhs.get_section_by_section(lhs_section)
+					if rhs_section:
+						print('comparing %s.%s...' % (lhs_section.segname, lhs_section.sectname), end=' ')
+						sys.stdout.flush()
+						lhs_data = lhs_section.get_contents(self)
+						rhs_data = rhs_section.get_contents(rhs)
+						if lhs_data and rhs_data:
+							if lhs_data == rhs_data:
+								print('ok')
+							else:
+								lhs_data_len = len(lhs_data)
+								rhs_data_len = len(rhs_data)
+								# if lhs_data_len < rhs_data_len:
+								#     if lhs_data == rhs_data[0:lhs_data_len]:
+								#         print 'section data for %s matches the first %u bytes' % (lhs_section.sectname, lhs_data_len)
+								#     else:
+								#         # TODO: check padding
+								#         result = False
+								# elif lhs_data_len > rhs_data_len:
+								#     if lhs_data[0:rhs_data_len] == rhs_data:
+								#         print 'section data for %s matches the first %u bytes' % (lhs_section.sectname, lhs_data_len)
+								#     else:
+								#         # TODO: check padding
+								#         result = False
+								# else:
+								result = False
+								print('error: sections differ')
+								# print 'a) %s' % (lhs_section)
+								# dump_hex_byte_string_diff(0, lhs_data, rhs_data)
+								# print 'b) %s' % (rhs_section)
+								# dump_hex_byte_string_diff(0, rhs_data, lhs_data)
+						elif lhs_data and not rhs_data:
+							print('error: section data missing from b:')
+							print('a) %s' % (lhs_section))
+							print('b) %s' % (rhs_section))
+							result = False
+						elif not lhs_data and rhs_data:
+							print('error: section data missing from a:')
+							print('a) %s' % (lhs_section))
+							print('b) %s' % (rhs_section))
+							result = False
+						elif lhs_section.offset or rhs_section.offset:
+							print('error: section data missing for both a and b:')
+							print('a) %s' % (lhs_section))
+							print('b) %s' % (rhs_section))
+							result = False
+						else:
+							print('ok')
+					else:
+						result = False
+						print('error: section %s is missing in %s' % (lhs_section.sectname, rhs.path))
+			else:
+				print('error: comparing a %s mach-o file with a %s mach-o file is not supported' % (self.type, rhs.type))
+				result = False
+			if not result:
+				print('error: mach files differ')
+			return result
+
+		def dump_header(self, dump_description=True, options=None):
+			if options.verbose:
+				print("MAGIC      CPU        SUBTYPE    FILETYPE   NUM CMDS SIZE CMDS  FLAGS")
+				print("---------- ---------- ---------- ---------- -------- ---------- ----------")
+			else:
+				print("MAGIC        ARCH       FILETYPE       NUM CMDS SIZE CMDS  FLAGS")
+				print("------------ ---------- -------------- -------- ---------- ----------")
+
+		def dump_flat(self, options):
+			if options.verbose:
+				print("%#8.8x %#8.8x %#8.8x %#8.8x %#8u %#8.8x %#8.8x" % (self.magic, self.arch.cpu, self.arch.sub, self.filetype.value, self.ncmds, self.sizeofcmds, self.flags.bits))
+			else:
+				print("%-12s %-10s %-14s %#8u %#8.8x %s" % (self.magic, self.arch, self.filetype, self.ncmds, self.sizeofcmds, self.flags))
+
+		def dump(self, options):
+			if options.dump_header:
+				self.dump_header(True, options)
+			if options.dump_load_commands:
+				self.dump_load_commands(False, options)
+			if options.dump_sections:
+				self.dump_sections(False, options)
+			if options.section_names:
+				self.dump_section_contents(options)
+			if options.dump_symtab:
+				self.get_symtab()
+				if len(self.symbols):
+					self.dump_sections(False, options)
+				else:
+					print("No symbols")
+			if options.find_mangled:
+				self.dump_symbol_names_matching_regex(re.compile('^_?_Z'))
+
+		def dump_header(self, dump_description=True, options=None):
+			if dump_description:
+				print(self.description())
+			print("Mach Header")
+			print("       magic: %#8.8x %s" % (self.magic.value, self.magic))
+			print("     cputype: %#8.8x" % (self.arch.cpu))
+			print("  cpusubtype: %#8.8x" % self.arch.sub)
+			print("    filetype: %#8.8x %s" % (self.filetype.get_enum_value(), self.filetype.get_enum_name()))
+			print("       ncmds: %#8.8x %u" % (self.ncmds, self.ncmds))
+			print("  sizeofcmds: %#8.8x" % self.sizeofcmds)
+			print("       flags: %#8.8x %s" % (self.flags.bits, self.flags))
+
+		def dump_load_commands(self, dump_description=True, options=None):
+			if dump_description:
+				print(self.description())
+			for lc in self.commands:
+				print(lc)
+
+		def get_section_by_name(self, name):
+			for section in self.sections:
+				if section.sectname and section.sectname == name:
+					return section
+			return None
+
+		def get_section_by_section(self, other_section):
+			for section in self.sections:
+				if section.sectname == other_section.sectname and section.segname == other_section.segname:
+					return section
+			return None
+
+		def dump_sections(self, dump_description=True, options=None):
+			if dump_description:
+				print(self.description())
+			num_sections = len(self.sections)
+			if num_sections > 1:
+				self.sections[1].dump_header()
+				for sect_idx in range(1, num_sections):
+					print("%s" % self.sections[sect_idx])
+
+		def dump_section_contents(self, options):
+			saved_section_to_disk = False
+			for sectname in options.section_names:
+				section = self.get_section_by_name(sectname)
+				if section:
+					sect_bytes = section.get_contents(self)
+					if options.outfile:
+						if not saved_section_to_disk:
+							outfile = open(options.outfile, 'w')
+							if options.extract_modules:
+								# print "Extracting modules from mach file..."
+								data = file_extract.FileExtract(
+									io.BytesIO(sect_bytes), self.data.byte_order)
+								version = data.get_uint32()
+								num_modules = data.get_uint32()
+								# print "version = %u, num_modules = %u" %
+								# (version, num_modules)
+								for i in range(num_modules):
+									data_offset = data.get_uint64()
+									data_size = data.get_uint64()
+									name_offset = data.get_uint32()
+									language = data.get_uint32()
+									flags = data.get_uint32()
+									data.seek(name_offset)
+									module_name = data.get_c_string()
+									# print "module[%u] data_offset = %#16.16x,
+									# data_size = %#16.16x, name_offset =
+									# %#16.16x (%s), language = %u, flags =
+									# %#x" % (i, data_offset, data_size,
+									# name_offset, module_name, language,
+									# flags)
+									data.seek(data_offset)
+									outfile.write(data.read_size(data_size))
+							else:
+								print("Saving section %s to '%s'" % (sectname, options.outfile))
+								outfile.write(sect_bytes)
+							outfile.close()
+							saved_section_to_disk = True
+						else:
+							print("error: you can only save a single section to disk at a time, skipping section '%s'" % (sectname))
+					else:
+						print('section %s:\n' % (sectname))
+						section.dump_header()
+						print('%s\n' % (section))
+						dump_memory(0, sect_bytes, options.max_count, 16)
+				else:
+					print('error: no section named "%s" was found' % (sectname))
+
+		def get_segment(self, segname):
+			if len(self.segments) == 1 and self.segments[0].segname == '':
+				return self.segments[0]
+			for segment in self.segments:
+				if segment.segname == segname:
+					return segment
+			return None
+
+		def get_first_load_command(self, lc_enum_value):
+			for lc in self.commands:
+				if lc.command.value == lc_enum_value:
+					return lc
+			return None
+
+		def get_symtab(self):
+			if self.data and not self.symbols:
+				lc_symtab = self.get_first_load_command(LC_SYMTAB)
+				if lc_symtab:
+					symtab_offset = self.file_off
+					if self.data.is_in_memory():
+						linkedit_segment = self.get_segment('__LINKEDIT')
+						if linkedit_segment:
+							linkedit_vmaddr = linkedit_segment.vmaddr
+							linkedit_fileoff = linkedit_segment.fileoff
+							symtab_offset = linkedit_vmaddr + lc_symtab.symoff - linkedit_fileoff
+							symtab_offset = linkedit_vmaddr + lc_symtab.stroff - linkedit_fileoff
+					else:
+						symtab_offset += lc_symtab.symoff
+
+					self.data.seek(symtab_offset)
+					is_64 = self.is_64_bit()
+					for i in range(lc_symtab.nsyms):
+						nlist = Mach.NList()
+						nlist.unpack(self, self.data, lc_symtab)
+						self.symbols.append(nlist)
+				else:
+					print("no LC_SYMTAB")
+
+		def dump_symtab(self, dump_description=True, options=None):
+			self.get_symtab()
+			if dump_description:
+				print(self.description())
+			for i, symbol in enumerate(self.symbols):
+				print('[%5u] %s' % (i, symbol))
+
+		def dump_symbol_names_matching_regex(self, regex, file=None):
+			self.get_symtab()
+			for symbol in self.symbols:
+				if symbol.name and regex.search(symbol.name):
+					print(symbol.name)
+					if file:
+						file.write('%s\n' % (symbol.name))
+
+		def is_64_bit(self):
+			return self.magic.is_64_bit()
+
+	class LoadCommand:
+
+		class Command(Enum):
+			enum = {
+				'LC_SEGMENT': LC_SEGMENT,
+				'LC_SYMTAB': LC_SYMTAB,
+				'LC_SYMSEG': LC_SYMSEG,
+				'LC_THREAD': LC_THREAD,
+				'LC_UNIXTHREAD': LC_UNIXTHREAD,
+				'LC_LOADFVMLIB': LC_LOADFVMLIB,
+				'LC_IDFVMLIB': LC_IDFVMLIB,
+				'LC_IDENT': LC_IDENT,
+				'LC_FVMFILE': LC_FVMFILE,
+				'LC_PREPAGE': LC_PREPAGE,
+				'LC_DYSYMTAB': LC_DYSYMTAB,
+				'LC_LOAD_DYLIB': LC_LOAD_DYLIB,
+				'LC_ID_DYLIB': LC_ID_DYLIB,
+				'LC_LOAD_DYLINKER': LC_LOAD_DYLINKER,
+				'LC_ID_DYLINKER': LC_ID_DYLINKER,
+				'LC_PREBOUND_DYLIB': LC_PREBOUND_DYLIB,
+				'LC_ROUTINES': LC_ROUTINES,
+				'LC_SUB_FRAMEWORK': LC_SUB_FRAMEWORK,
+				'LC_SUB_UMBRELLA': LC_SUB_UMBRELLA,
+				'LC_SUB_CLIENT': LC_SUB_CLIENT,
+				'LC_SUB_LIBRARY': LC_SUB_LIBRARY,
+				'LC_TWOLEVEL_HINTS': LC_TWOLEVEL_HINTS,
+				'LC_PREBIND_CKSUM': LC_PREBIND_CKSUM,
+				'LC_LOAD_WEAK_DYLIB': LC_LOAD_WEAK_DYLIB,
+				'LC_SEGMENT_64': LC_SEGMENT_64,
+				'LC_ROUTINES_64': LC_ROUTINES_64,
+				'LC_UUID': LC_UUID,
+				'LC_RPATH': LC_RPATH,
+				'LC_CODE_SIGNATURE': LC_CODE_SIGNATURE,
+				'LC_SEGMENT_SPLIT_INFO': LC_SEGMENT_SPLIT_INFO,
+				'LC_REEXPORT_DYLIB': LC_REEXPORT_DYLIB,
+				'LC_LAZY_LOAD_DYLIB': LC_LAZY_LOAD_DYLIB,
+				'LC_ENCRYPTION_INFO': LC_ENCRYPTION_INFO,
+				'LC_DYLD_INFO': LC_DYLD_INFO,
+				'LC_DYLD_INFO_ONLY': LC_DYLD_INFO_ONLY,
+				'LC_LOAD_UPWARD_DYLIB': LC_LOAD_UPWARD_DYLIB,
+				'LC_VERSION_MIN_MACOSX': LC_VERSION_MIN_MACOSX,
+				'LC_VERSION_MIN_IPHONEOS': LC_VERSION_MIN_IPHONEOS,
+				'LC_FUNCTION_STARTS': LC_FUNCTION_STARTS,
+				'LC_DYLD_ENVIRONMENT': LC_DYLD_ENVIRONMENT
+			}
+
+			def __init__(self, initial_value=0):
+				Enum.__init__(self, initial_value, self.enum)
+
+		def __init__(self, c=None, l=0, o=0):
+			if c is not None:
+				self.command = c
+			else:
+				self.command = Mach.LoadCommand.Command(0)
+			self.length = l
+			self.file_off = o
+
+		def unpack(self, mach_file, data):
+			self.file_off = data.tell()
+			self.command.value, self.length = data.get_n_uint32(2)
+
+		def skip(self, data):
+			data.seek(self.file_off + self.length, 0)
+
+		def __str__(self):
+			lc_name = self.command.get_enum_name()
+			return '%#8.8x: <%#4.4x> %-24s' % (self.file_off,
+											   self.length, lc_name)
+
+	class Section:
+
+		def __init__(self):
+			self.index = 0
+			self.is_64 = False
+			self.sectname = None
+			self.segname = None
+			self.addr = 0
+			self.size = 0
+			self.offset = 0
+			self.align = 0
+			self.reloff = 0
+			self.nreloc = 0
+			self.flags = 0
+			self.reserved1 = 0
+			self.reserved2 = 0
+			self.reserved3 = 0
+
+		def unpack(self, is_64, data):
+			self.is_64 = is_64
+			self.sectname = data.get_fixed_length_c_string(16, '', True)
+			self.segname = data.get_fixed_length_c_string(16, '', True)
+			if self.is_64:
+				self.addr, self.size = data.get_n_uint64(2)
+				self.offset, self.align, self.reloff, self.nreloc, self.flags, self.reserved1, self.reserved2, self.reserved3 = data.get_n_uint32(
+					8)
+			else:
+				self.addr, self.size = data.get_n_uint32(2)
+				self.offset, self.align, self.reloff, self.nreloc, self.flags, self.reserved1, self.reserved2 = data.get_n_uint32(
+					7)
+
+		def dump_header(self):
+			if self.is_64:
+				print("INDEX ADDRESS            SIZE               OFFSET     ALIGN      RELOFF     NRELOC     FLAGS      RESERVED1  RESERVED2  RESERVED3  NAME")
+				print("===== ------------------ ------------------ ---------- ---------- ---------- ---------- ---------- ---------- ---------- ---------- ----------------------")
+			else:
+				print("INDEX ADDRESS    SIZE       OFFSET     ALIGN      RELOFF     NRELOC     FLAGS      RESERVED1  RESERVED2  NAME")
+				print("===== ---------- ---------- ---------- ---------- ---------- ---------- ---------- ---------- ---------- ----------------------")
+
+		def __str__(self):
+			if self.is_64:
+				return "[%3u] %#16.16x %#16.16x %#8.8x %#8.8x %#8.8x %#8.8x %#8.8x %#8.8x %#8.8x %#8.8x %s.%s" % (
+					self.index, self.addr, self.size, self.offset, self.align, self.reloff, self.nreloc, self.flags, self.reserved1, self.reserved2, self.reserved3, self.segname, self.sectname)
+			else:
+				return "[%3u] %#8.8x %#8.8x %#8.8x %#8.8x %#8.8x %#8.8x %#8.8x %#8.8x %#8.8x %s.%s" % (
+					self.index, self.addr, self.size, self.offset, self.align, self.reloff, self.nreloc, self.flags, self.reserved1, self.reserved2, self.segname, self.sectname)
+
+		def get_contents(self, mach_file):
+			'''Get the section contents as a python string'''
+			if self.size > 0 and mach_file.get_segment(
+					self.segname).filesize > 0:
+				data = mach_file.get_data()
+				if data:
+					section_data_offset = mach_file.file_off + self.offset
+					# print '%s.%s is at offset 0x%x with size 0x%x' %
+					# (self.segname, self.sectname, section_data_offset,
+					# self.size)
+					data.push_offset_and_seek(section_data_offset)
+					bytes = data.read_size(self.size)
+					data.pop_offset_and_seek()
+					return bytes
+			return None
+
+	class DylibLoadCommand(LoadCommand):
+
+		def __init__(self, lc):
+			Mach.LoadCommand.__init__(self, lc.command, lc.length, lc.file_off)
+			self.name = None
+			self.timestamp = 0
+			self.current_version = 0
+			self.compatibility_version = 0
+
+		def unpack(self, mach_file, data):
+			byte_order_char = mach_file.magic.get_byte_order()
+			name_offset, self.timestamp, self.current_version, self.compatibility_version = data.get_n_uint32(
+				4)
+			data.seek(self.file_off + name_offset, 0)
+			self.name = data.get_fixed_length_c_string(self.length - 24)
+
+		def __str__(self):
+			s = Mach.LoadCommand.__str__(self)
+			s += "%#8.8x %#8.8x %#8.8x " % (self.timestamp,
+											self.current_version,
+											self.compatibility_version)
+			s += self.name
+			return s
+
+	class LoadDYLDLoadCommand(LoadCommand):
+
+		def __init__(self, lc):
+			Mach.LoadCommand.__init__(self, lc.command, lc.length, lc.file_off)
+			self.name = None
+
+		def unpack(self, mach_file, data):
+			data.get_uint32()
+			self.name = data.get_fixed_length_c_string(self.length - 12)
+
+		def __str__(self):
+			s = Mach.LoadCommand.__str__(self)
+			s += "%s" % self.name
+			return s
+
+	class UnixThreadLoadCommand(LoadCommand):
+
+		class ThreadState:
+
+			def __init__(self):
+				self.flavor = 0
+				self.count = 0
+				self.register_values = list()
+
+			def unpack(self, data):
+				self.flavor, self.count = data.get_n_uint32(2)
+				self.register_values = data.get_n_uint32(self.count)
+
+			def __str__(self):
+				s = "flavor = %u, count = %u, regs =" % (
+					self.flavor, self.count)
+				i = 0
+				for register_value in self.register_values:
+					if i % 8 == 0:
+						s += "\n                                            "
+					s += " %#8.8x" % register_value
+					i += 1
+				return s
+
+		def __init__(self, lc):
+			Mach.LoadCommand.__init__(self, lc.command, lc.length, lc.file_off)
+			self.reg_sets = list()
+
+		def unpack(self, mach_file, data):
+			reg_set = Mach.UnixThreadLoadCommand.ThreadState()
+			reg_set.unpack(data)
+			self.reg_sets.append(reg_set)
+
+		def __str__(self):
+			s = Mach.LoadCommand.__str__(self)
+			for reg_set in self.reg_sets:
+				s += "%s" % reg_set
+			return s
+
+	class DYLDInfoOnlyLoadCommand(LoadCommand):
+
+		def __init__(self, lc):
+			Mach.LoadCommand.__init__(self, lc.command, lc.length, lc.file_off)
+			self.rebase_off = 0
+			self.rebase_size = 0
+			self.bind_off = 0
+			self.bind_size = 0
+			self.weak_bind_off = 0
+			self.weak_bind_size = 0
+			self.lazy_bind_off = 0
+			self.lazy_bind_size = 0
+			self.export_off = 0
+			self.export_size = 0
+
+		def unpack(self, mach_file, data):
+			byte_order_char = mach_file.magic.get_byte_order()
+			self.rebase_off, self.rebase_size, self.bind_off, self.bind_size, self.weak_bind_off, self.weak_bind_size, self.lazy_bind_off, self.lazy_bind_size, self.export_off, self.export_size = data.get_n_uint32(
+				10)
+
+		def __str__(self):
+			s = Mach.LoadCommand.__str__(self)
+			s += "rebase_off = %#8.8x, rebase_size = %u, " % (
+				self.rebase_off, self.rebase_size)
+			s += "bind_off = %#8.8x, bind_size = %u, " % (
+				self.bind_off, self.bind_size)
+			s += "weak_bind_off = %#8.8x, weak_bind_size = %u, " % (
+				self.weak_bind_off, self.weak_bind_size)
+			s += "lazy_bind_off = %#8.8x, lazy_bind_size = %u, " % (
+				self.lazy_bind_off, self.lazy_bind_size)
+			s += "export_off = %#8.8x, export_size = %u, " % (
+				self.export_off, self.export_size)
+			return s
+
+	class DYLDSymtabLoadCommand(LoadCommand):
+
+		def __init__(self, lc):
+			Mach.LoadCommand.__init__(self, lc.command, lc.length, lc.file_off)
+			self.ilocalsym = 0
+			self.nlocalsym = 0
+			self.iextdefsym = 0
+			self.nextdefsym = 0
+			self.iundefsym = 0
+			self.nundefsym = 0
+			self.tocoff = 0
+			self.ntoc = 0
+			self.modtaboff = 0
+			self.nmodtab = 0
+			self.extrefsymoff = 0
+			self.nextrefsyms = 0
+			self.indirectsymoff = 0
+			self.nindirectsyms = 0
+			self.extreloff = 0
+			self.nextrel = 0
+			self.locreloff = 0
+			self.nlocrel = 0
+
+		def unpack(self, mach_file, data):
+			byte_order_char = mach_file.magic.get_byte_order()
+			self.ilocalsym, self.nlocalsym, self.iextdefsym, self.nextdefsym, self.iundefsym, self.nundefsym, self.tocoff, self.ntoc, self.modtaboff, self.nmodtab, self.extrefsymoff, self.nextrefsyms, self.indirectsymoff, self.nindirectsyms, self.extreloff, self.nextrel, self.locreloff, self.nlocrel = data.get_n_uint32(
+				18)
+
+		def __str__(self):
+			s = Mach.LoadCommand.__str__(self)
+			# s += "ilocalsym = %u, nlocalsym = %u, " % (self.ilocalsym, self.nlocalsym)
+			# s += "iextdefsym = %u, nextdefsym = %u, " % (self.iextdefsym, self.nextdefsym)
+			# s += "iundefsym %u, nundefsym = %u, " % (self.iundefsym, self.nundefsym)
+			# s += "tocoff = %#8.8x, ntoc = %u, " % (self.tocoff, self.ntoc)
+			# s += "modtaboff = %#8.8x, nmodtab = %u, " % (self.modtaboff, self.nmodtab)
+			# s += "extrefsymoff = %#8.8x, nextrefsyms = %u, " % (self.extrefsymoff, self.nextrefsyms)
+			# s += "indirectsymoff = %#8.8x, nindirectsyms = %u, " % (self.indirectsymoff, self.nindirectsyms)
+			# s += "extreloff = %#8.8x, nextrel = %u, " % (self.extreloff, self.nextrel)
+			# s += "locreloff = %#8.8x, nlocrel = %u" % (self.locreloff,
+			# self.nlocrel)
+			s += "ilocalsym      = %-10u, nlocalsym     = %u\n" % (
+				self.ilocalsym, self.nlocalsym)
+			s += "                                             iextdefsym     = %-10u, nextdefsym    = %u\n" % (
+				self.iextdefsym, self.nextdefsym)
+			s += "                                             iundefsym      = %-10u, nundefsym     = %u\n" % (
+				self.iundefsym, self.nundefsym)
+			s += "                                             tocoff         = %#8.8x, ntoc          = %u\n" % (
+				self.tocoff, self.ntoc)
+			s += "                                             modtaboff      = %#8.8x, nmodtab       = %u\n" % (
+				self.modtaboff, self.nmodtab)
+			s += "                                             extrefsymoff   = %#8.8x, nextrefsyms   = %u\n" % (
+				self.extrefsymoff, self.nextrefsyms)
+			s += "                                             indirectsymoff = %#8.8x, nindirectsyms = %u\n" % (
+				self.indirectsymoff, self.nindirectsyms)
+			s += "                                             extreloff      = %#8.8x, nextrel       = %u\n" % (
+				self.extreloff, self.nextrel)
+			s += "                                             locreloff      = %#8.8x, nlocrel       = %u" % (
+				self.locreloff, self.nlocrel)
+			return s
+
+	class SymtabLoadCommand(LoadCommand):
+
+		def __init__(self, lc):
+			Mach.LoadCommand.__init__(self, lc.command, lc.length, lc.file_off)
+			self.symoff = 0
+			self.nsyms = 0
+			self.stroff = 0
+			self.strsize = 0
+
+		def unpack(self, mach_file, data):
+			byte_order_char = mach_file.magic.get_byte_order()
+			self.symoff, self.nsyms, self.stroff, self.strsize = data.get_n_uint32(
+				4)
+
+		def __str__(self):
+			s = Mach.LoadCommand.__str__(self)
+			s += "symoff = %#8.8x, nsyms = %u, stroff = %#8.8x, strsize = %u" % (
+				self.symoff, self.nsyms, self.stroff, self.strsize)
+			return s
+
+	class UUIDLoadCommand(LoadCommand):
+
+		def __init__(self, lc):
+			Mach.LoadCommand.__init__(self, lc.command, lc.length, lc.file_off)
+			self.uuid = None
+
+		def unpack(self, mach_file, data):
+			uuid_data = data.get_n_uint8(16)
+			uuid_str = ''
+			for byte in uuid_data:
+				uuid_str += '%2.2x' % byte
+			self.uuid = uuid.UUID(uuid_str)
+			mach_file.uuid = self.uuid
+
+		def __str__(self):
+			s = Mach.LoadCommand.__str__(self)
+			s += self.uuid.__str__()
+			return s
+
+	class DataBlobLoadCommand(LoadCommand):
+
+		def __init__(self, lc):
+			Mach.LoadCommand.__init__(self, lc.command, lc.length, lc.file_off)
+			self.dataoff = 0
+			self.datasize = 0
+
+		def unpack(self, mach_file, data):
+			byte_order_char = mach_file.magic.get_byte_order()
+			self.dataoff, self.datasize = data.get_n_uint32(2)
+
+		def __str__(self):
+			s = Mach.LoadCommand.__str__(self)
+			s += "dataoff = %#8.8x, datasize = %u" % (
+				self.dataoff, self.datasize)
+			return s
+
+	class EncryptionInfoLoadCommand(LoadCommand):
+
+		def __init__(self, lc):
+			Mach.LoadCommand.__init__(self, lc.command, lc.length, lc.file_off)
+			self.cryptoff = 0
+			self.cryptsize = 0
+			self.cryptid = 0
+
+		def unpack(self, mach_file, data):
+			byte_order_char = mach_file.magic.get_byte_order()
+			self.cryptoff, self.cryptsize, self.cryptid = data.get_n_uint32(3)
+
+		def __str__(self):
+			s = Mach.LoadCommand.__str__(self)
+			s += "file-range = [%#8.8x - %#8.8x), cryptsize = %u, cryptid = %u" % (
+				self.cryptoff, self.cryptoff + self.cryptsize, self.cryptsize, self.cryptid)
+			return s
+
+	class SegmentLoadCommand(LoadCommand):
+
+		def __init__(self, lc):
+			Mach.LoadCommand.__init__(self, lc.command, lc.length, lc.file_off)
+			self.sectname = None
+			self.segname = None
+			self.vmaddr = 0
+			self.vmsize = 0
+			self.fileoff = 0
+			self.filesize = 0
+			self.maxprot = 0
+			self.initprot = 0
+			self.nsects = 0
+			self.flags = 0
+
+		def unpack(self, mach_file, data):
+			is_64 = self.command.get_enum_value() == LC_SEGMENT_64
+			self.segname = data.get_fixed_length_c_string(16, '', True)
+			if is_64:
+				self.vmaddr, self.vmsize, self.fileoff, self.filesize = data.get_n_uint64(4)
+			else:
+				self.vmaddr, self.vmsize, self.fileoff, self.filesize = data.get_n_uint32(4)
+			self.maxprot, self.initprot, self.nsects, self.flags = data.get_n_uint32(4)
+			mach_file.segments.append(self)
+
+			for i in range(self.nsects):
+				section = Mach.Section()
+				section.unpack(is_64, data)
+				section.index = len(mach_file.sections)
+				mach_file.sections.append(section)
+
+		def __str__(self):
+			s = Mach.LoadCommand.__str__(self)
+			if self.command.get_enum_value() == LC_SEGMENT:
+				s += "%#8.8x %#8.8x %#8.8x %#8.8x " % (
+					self.vmaddr, self.vmsize, self.fileoff, self.filesize)
+			else:
+				s += "%#16.16x %#16.16x %#16.16x %#16.16x " % (
+					self.vmaddr, self.vmsize, self.fileoff, self.filesize)
+			s += "%s %s %3u %#8.8x" % (vm_prot_names[self.maxprot], vm_prot_names[
+									   self.initprot], self.nsects, self.flags)
+			s += ' ' + self.segname
+			return s
+
+	class NList:
+
+		class Type:
+
+			class Stab(Enum):
+				enum = {
+					'N_GSYM': N_GSYM,
+					'N_FNAME': N_FNAME,
+					'N_FUN': N_FUN,
+					'N_STSYM': N_STSYM,
+					'N_LCSYM': N_LCSYM,
+					'N_BNSYM': N_BNSYM,
+					'N_OPT': N_OPT,
+					'N_RSYM': N_RSYM,
+					'N_SLINE': N_SLINE,
+					'N_ENSYM': N_ENSYM,
+					'N_SSYM': N_SSYM,
+					'N_SO': N_SO,
+					'N_OSO': N_OSO,
+					'N_LSYM': N_LSYM,
+					'N_BINCL': N_BINCL,
+					'N_SOL': N_SOL,
+					'N_PARAMS': N_PARAMS,
+					'N_VERSION': N_VERSION,
+					'N_OLEVEL': N_OLEVEL,
+					'N_PSYM': N_PSYM,
+					'N_EINCL': N_EINCL,
+					'N_ENTRY': N_ENTRY,
+					'N_LBRAC': N_LBRAC,
+					'N_EXCL': N_EXCL,
+					'N_RBRAC': N_RBRAC,
+					'N_BCOMM': N_BCOMM,
+					'N_ECOMM': N_ECOMM,
+					'N_ECOML': N_ECOML,
+					'N_LENG': N_LENG
+				}
+
+				def __init__(self, magic=0):
+					Enum.__init__(self, magic, self.enum)
+
+			def __init__(self, t=0):
+				self.value = t
+
+			def __str__(self):
+				n_type = self.value
+				if n_type & N_STAB:
+					stab = Mach.NList.Type.Stab(self.value)
+					return '%s' % stab
+				else:
+					type = self.value & N_TYPE
+					type_str = ''
+					if type == N_UNDF:
+						type_str = 'N_UNDF'
+					elif type == N_ABS:
+						type_str = 'N_ABS '
+					elif type == N_SECT:
+						type_str = 'N_SECT'
+					elif type == N_PBUD:
+						type_str = 'N_PBUD'
+					elif type == N_INDR:
+						type_str = 'N_INDR'
+					else:
+						type_str = "??? (%#2.2x)" % type
+					if n_type & N_PEXT:
+						type_str += ' | PEXT'
+					if n_type & N_EXT:
+						type_str += ' | EXT '
+					return type_str
+
+		def __init__(self):
+			self.index = 0
+			self.name_offset = 0
+			self.name = 0
+			self.type = Mach.NList.Type()
+			self.sect_idx = 0
+			self.desc = 0
+			self.value = 0
+
+		def unpack(self, mach_file, data, symtab_lc):
+			self.index = len(mach_file.symbols)
+			self.name_offset = data.get_uint32()
+			self.type.value, self.sect_idx = data.get_n_uint8(2)
+			self.desc = data.get_uint16()
+			if mach_file.is_64_bit():
+				self.value = data.get_uint64()
+			else:
+				self.value = data.get_uint32()
+			data.push_offset_and_seek(
+				mach_file.file_off +
+				symtab_lc.stroff +
+				self.name_offset)
+			# print "get string for symbol[%u]" % self.index
+			self.name = data.get_c_string()
+			data.pop_offset_and_seek()
+
+		def __str__(self):
+			name_display = ''
+			if len(self.name):
+				name_display = ' "%s"' % self.name
+			return '%#8.8x %#2.2x (%-20s) %#2.2x %#4.4x %16.16x%s' % (self.name_offset,
+																	  self.type.value, self.type, self.sect_idx, self.desc, self.value, name_display)
+
+	class Interactive(cmd.Cmd):
+		'''Interactive command interpreter to mach-o files.'''
+
+		def __init__(self, mach, options):
+			cmd.Cmd.__init__(self)
+			self.intro = 'Interactive mach-o command interpreter'
+			self.prompt = 'mach-o: %s %% ' % mach.path
+			self.mach = mach
+			self.options = options
+
+		def default(self, line):
+			'''Catch all for unknown command, which will exit the interpreter.'''
+			print("uknown command: %s" % line)
+			return True
+
+		def do_q(self, line):
+			'''Quit command'''
+			return True
+
+		def do_quit(self, line):
+			'''Quit command'''
+			return True
+
+		def do_header(self, line):
+			'''Dump mach-o file headers'''
+			self.mach.dump_header(True, self.options)
+			return False
+
+		def do_load(self, line):
+			'''Dump all mach-o load commands'''
+			self.mach.dump_load_commands(True, self.options)
+			return False
+
+		def do_sections(self, line):
+			'''Dump all mach-o sections'''
+			self.mach.dump_sections(True, self.options)
+			return False
+
+		def do_symtab(self, line):
+			'''Dump all mach-o symbols in the symbol table'''
+			self.mach.dump_symtab(True, self.options)
+			return False
 
 #################################################################################
 ############################ COMMANDS ###########################################
@@ -717,9 +2179,55 @@ class ChecksecCommand(LLDBCommand):
 		]	
 	
 	def run(self, arguments, option):
+		if arguments[0] == False:
+			arguments[0] = lldb.debugger.GetSelectedTarget().GetExecutable().fullpath
+		
+		mach = Mach(lldb.debugger)
+		mach.parse(arguments[0])
+		mach.content.checksec()
+
+class ReadMachoCommand(LLDBCommand):
+	def name(self):
+		return "macho"
+	
+	def description(self):
+		return "Dump Macho-O headers"
+	
+	def args(self):
+		return [
+			CommandArgument(
+				arg="macho",
+				type="str",
+				help="Path to mach-o binary. Usage: macho /usr/bin/qlmanage or macho",
+			)
+		]	
+	
+	def run(self, arguments, option):
+		if arguments[0] == False:
+			arguments[0] = lldb.debugger.GetSelectedTarget().GetExecutable().fullpath
+		
+		mach = Mach(lldb.debugger)
+		mach.parse(arguments[0])
+		mach.content.dump_header()
+
+class BreakOnMainCommand(LLDBCommand):
+	def name(self):
+		return "bmain"
+	
+	def description(self):
+		return "Break on main"
+
+	def args(self):
+		return [
+		]	
+	
+	def run(self, arguments, option):
 		if arguments[0]==False:
 			path = lldb.debugger.GetSelectedTarget().GetExecutable().fullpath
-			MachOBinary(path, lldb.debugger)
+			mach = MachOBinary(path, lldb.debugger)
+			mach.macho.display_headers()
+		else:
+			MachOBinary(arguments[0], lldb.debugger)
 
 def exploitable(debugger,cmd,res,dict):
 	"""checks if the crash is exploitable"""
@@ -739,4 +2247,5 @@ def __lldb_init_module(debugger, dict):
 
 	loadCommand(current_module, ASLRCommand(), "lisa")
 	loadCommand(current_module, ChecksecCommand(), "lisa")
+	loadCommand(current_module, ReadMachoCommand(), "lisa")
 	
