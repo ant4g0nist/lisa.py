@@ -87,7 +87,7 @@ def get_target_arch():
 	if arch == "arm64":
 		return AARCH64()
 	elif arch == "x86_64":
-		return x86_64()
+		return X8664()
 	else:
 		errlog(f"Architecture {arch} not supported")
 
@@ -2404,7 +2404,7 @@ class AARCH64(Architecture):
 			else:
 				print(f"   {i.address:x}{RED} :\t{GRN}{i.mnemonic}{RST}\t{i.op_str}")
 
-class X86_64(Architecture):
+class X8664(Architecture):
 	arch = "X86"
 	mode = "64"
 
@@ -2426,7 +2426,7 @@ class X86_64(Architecture):
 		21: "identification",
 	}
 	
-	flag_register = "eflags"
+	flag_register = "rflags"
 
 	special_registers = ["cs", "ss", "ds", "es", "fs", "gs"]
 
@@ -2511,7 +2511,6 @@ class X86_64(Architecture):
 		cs.detail   = True
 
 		for i in cs.disasm(buffer, address):
-			print(f"{address:x}{RED}:\t{GRN}{i.mnemonic}{RST}\t{i.op_str}")
 			if i.address == pc:
 				msg = ""
 				if self.is_conditional_branch(i):
@@ -2733,6 +2732,7 @@ class ContextCommand(LLDBCommand):
 
 	def print_thread_context(self, thread, process):
 		context_title(f"thread #{thread.idx}")
+
 		frame 	= thread.GetFrameAtIndex(0)
 		address	= frame.pc
 		
