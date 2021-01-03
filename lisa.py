@@ -1,17 +1,22 @@
 import os
 import re
+import abc
 import cmd
 import sys
 import lldb
 import stat
 import uuid
+import fcntl
 import shlex
 import string
 import struct
 import fnmatch
+import termios
+import capstone
 import platform
+import functools
 import subprocess
-from ctypes import *
+from capstone import *
 from optparse import OptionParser
 
 BLK = "\033[30m"
@@ -23,6 +28,8 @@ MAG = "\033[35m"
 CYN = "\033[36m"
 WHT = "\033[37m"
 RST = "\033[0m"
+HORIZONTAL_LINE = "\u2500"
+VERTICAL_LINE = "\u2502"
 
 __prompt__ = f"'(lisa:>) '"
 
@@ -37,6 +44,23 @@ CPU_TYPE_ARM64  = CPU_TYPE_ARM | CPU_ARCH_ABI64
 dlog    = lambda msg: print(f"{GRN}{msg}{RST}")
 warnlog	= lambda msg: print(f"{YEL}{msg}{RST}")
 errlog	= lambda msg: print(f"{RED}{msg}{RST}")
+
+tty_rows, tty_columns = struct.unpack("hh", fcntl.ioctl(1, termios.TIOCGWINSZ, "1234"))
+
+def context_title(m):
+	line_color= YEL
+	msg_color = GRN
+
+	if not m:
+		print(Color.colorify(HORIZONTAL_LINE * tty_columns, line_color))
+		return
+
+	trail_len = len(m) + 8
+	title = ""
+	title += line_color+" {:{padd}<{width}} ".format("", width=max(tty_columns - trail_len, 0), padd=HORIZONTAL_LINE)+RST
+	title += f"{msg_color}{m}{RST}"
+	title += line_color+" {:{padd}<4}".format("", padd=HORIZONTAL_LINE)+RST
+	print(title)
 
 def get_host_machine():
 	return platform.machine()
@@ -55,13 +79,22 @@ def cpu_to_string(cpu):
 	elif cpu == CPU_TYPE_ARM64:
 		return "arm64"
 
-def get_target_arch():
-	return lldb.debugger.GetSelectedTarget().triple.split('-')[0]
+def get_target_triple():
+	return lldb.debugger.GetSelectedTarget().triple
 
-def runShellCommand(command, shell=True):
+def get_target_arch():
+	arch = lldb.debugger.GetSelectedTarget().triple.split('-')[0]
+	if arch == "arm64":
+		return AARCH64()
+	elif arch == "x86_64":
+		return x86_64()
+	else:
+		errlog(f"Architecture {arch} not supported")
+
+def run_shell_command(command, shell=True):
 	return subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=shell)
 
-def makeRunCommand(command):
+def make_run_command(command):
 	def runCommand(debugger, input, exe_ctx, result, _):
 		command.result = result
 		command.context = exe_ctx
@@ -78,7 +111,7 @@ def makeRunCommand(command):
 			if "--" not in splitInput:
 				splitInput.insert(0, "--")
 
-		parser = optionParserForCommand(command)
+		parser = option_parser_for_command(command)
 		(options, args) = parser.parse_args(splitInput)
 
 		# When there are more args than the command has declared, assume
@@ -88,15 +121,15 @@ def makeRunCommand(command):
 			head = args[: overhead + 1]  # Take N+1 and reduce to 1.
 			args = [" ".join(head)] + args[-overhead:]
 
-		if validateArgsForCommand(args, command):
+		if validate_args_for_command(args, command):
 			command.run(args, options)
 
-	runCommand.__doc__ = helpForCommand(command)
+	runCommand.__doc__ = help_for_command(command)
 	return runCommand
 
-def loadCommand(module, command, filename):
+def load_command(module, command, filename):
 
-	func = makeRunCommand(command)
+	func = make_run_command(command)
 
 	name = command.name()
 
@@ -128,7 +161,7 @@ def loadCommand(module, command, filename):
 		)
 	)
 
-def validateArgsForCommand(args, command):
+def validate_args_for_command(args, command):
 	if len(args) < len(command.args()):
 		defaultArgs = [arg.required for arg in command.args()]
 		defaultArgsToAppend = defaultArgs[len(args) :]
@@ -146,7 +179,7 @@ def validateArgsForCommand(args, command):
 	return True
 
 
-def optionParserForCommand(command):
+def option_parser_for_command(command):
 	parser = OptionParser()
 
 	for argument in command.options():
@@ -170,7 +203,7 @@ def optionParserForCommand(command):
 	return parser
 
 
-def helpForCommand(command):
+def help_for_command(command):
 	help = command.description()
 
 	argSyntax = ""
@@ -216,7 +249,7 @@ def helpForCommand(command):
 
 	return help
 
-def usageForCommand(command):
+def usage_for_command(command):
 	usage = command.name()
 	for arg in command.args():
 		if arg.default:
@@ -225,9 +258,6 @@ def usageForCommand(command):
 			usage += " " + arg.argName
 
 	return usage
-
-def runCommand(command):
-	lldb.debugger.HandleCommand(command)
 
 class CommandArgument:  # noqa B903
 	def __init__(
@@ -272,7 +302,7 @@ def swap_unpack_char():
 	return '>'
 
 
-def dump_hex_bytes(addr, s, bytes_per_line=16):
+def dump_hex_bytes(addr, s, bytes_per_line=8):
 	i = 0
 	line = ''
 	for ch in s:
@@ -280,7 +310,7 @@ def dump_hex_bytes(addr, s, bytes_per_line=16):
 			if line:
 				print(line)
 			line = '%#8.8x: ' % (addr + i)
-		line += "%02X " % ord(ch)
+		line += "0x%02x " % ch
 		i += 1
 	print(line)
 
@@ -769,7 +799,6 @@ N_LENG = 0xfe
 
 vm_prot_names = ['---', 'r--', '-w-', 'rw-', '--x', 'r-x', '-wx', 'rwx']
 
-
 class Mach:
 	"""Class that does everything mach-o related"""
 
@@ -1211,7 +1240,7 @@ class Mach:
 
 		def has_restricted(self):
 			#3 cases restrictedBySetGUid, restrictedBySegment, restrictedByEntitlements
-			codesign = runShellCommand(f"codesign -dvvvv '{self.path}'").stderr.decode() #stderr ( :| ) ???
+			codesign = run_shell_command(f"codesign -dvvvv '{self.path}'").stderr.decode() #stderr ( :| ) ???
 			
 			if codesign and "Authority=Apple Root CA" in codesign:
 				authority = ""
@@ -1232,7 +1261,7 @@ class Mach:
 			return False
 			
 		def description(self):
-			return '%#8.8x: %s' % (self.file_off, self.path)
+			return '%#8.8x: %s (%s)' % (self.file_off, self.path, self.arch)
 
 		def unpack(self, data, magic=None):
 			self.data = data
@@ -2118,10 +2147,398 @@ class Mach:
 			'''Dump all mach-o symbols in the symbol table'''
 			self.mach.dump_symtab(True, self.options)
 			return False
+#################################################################################
+############################ ARCH definition ####################################
+#################################################################################
+def run_command(command):
+	lldb.debugger.HandleCommand(command)
+
+# execute command and return output
+def run_command_return_output(debugger,lldb_command, result, dict):
+	"""Execute given command and returns the outout"""
+	res = lldb.SBCommandReturnObject()
+	command_iterpreter.HandleCommand(lldb_command,res)
+	output = res.GetOutput()
+	error = res.GetError()
+	return (output,error)
+
+def get_register(reg):
+	target 	= lldb.debugger.GetSelectedTarget()
+	process = target.process
+	thread	= process.GetSelectedThread()
+	frame	= thread.GetSelectedFrame()
+
+	if reg=="pc":
+		return frame.pc
+	
+	if reg=="sp":
+		return frame.sp
+	
+	if reg=="fp":
+		return frame.fp
+	
+	if type(reg)==capstone.arm64.Arm64Op:
+		reg = reg.value
+	
+	result = ""
+	output,error = run_command_return_output(lldb.debugger, 'register read '+reg, result, dict)
+
+	return int(output.split("= ")[-1].split(" ")[0], 16)
+	
+def flags_to_human(reg_value, value_table):
+	"""Return a human readable string showing the flag states."""
+	flags = []
+	for i in value_table:
+		# flag_str = Color.boldify(value_table[i].upper()) if reg_value & (1<<i) else value_table[i].lower()
+		flag_str = f"{RED}{value_table[i].upper()}{RST}" if reg_value & (1<<i) else value_table[i].lower()
+		flags.append(flag_str)
+	return "[{}]".format(" ".join(flags))
+
+class Architecture(object):
+	"""Generic metaclass for the architecture supported by GEF."""
+	__metaclass__ = abc.ABCMeta
+
+	@abc.abstractproperty
+	def all_registers(self):                       pass
+	@abc.abstractproperty
+	def instruction_length(self):                  pass
+	@abc.abstractproperty
+	def nop_insn(self):                            pass
+	@abc.abstractproperty
+	def return_register(self):                     pass
+	@abc.abstractproperty
+	def flag_register(self):                       pass
+	@abc.abstractproperty
+	def flags_table(self):                         pass
+	@abc.abstractproperty
+	def function_parameters(self):                 pass
+	@abc.abstractmethod
+	def flag_register_to_human(self, val=None):    pass
+	@abc.abstractmethod
+	def is_call(self, insn):                       pass
+	@abc.abstractmethod
+	def is_ret(self, insn):                        pass
+	@abc.abstractmethod
+	def is_conditional_branch(self, insn):         pass
+	@abc.abstractmethod
+	def is_branch_taken(self, insn):               pass
+	@abc.abstractmethod
+	def get_ra(self, insn, frame):                 pass
+
+	special_registers = []
+
+	@property
+	def pc(self):
+		return get_register("pc")
+
+	@property
+	def sp(self):
+		return get_register("sp")
+
+	@property
+	def fp(self):
+		return get_register("fp")
+
+	@property
+	def ptrsize(self):
+		return get_memory_alignment()
+
+	def get_ith_parameter(self, i, in_func=True):
+		"""Retrieves the correct parameter used for the current function call."""
+		reg = self.function_parameters[i]
+		val = get_register(reg)
+		key = reg
+		return key, val
+
+def capstone_analyze_pc(current_arch, insn, nb_insn):
+	if current_arch.is_conditional_branch(insn):
+		is_taken, reason = current_arch.is_branch_taken(insn)
+		if is_taken:
+			reason = "[Reason: {:s}]".format(reason) if reason else ""
+			msg = f"{GRN}TAKEN {reason}{RST}"
+		else:
+			reason = "[Reason: !({:s})]".format(reason) if reason else ""
+			msg = f"{RED}NOT taken {reason}{RST}"
+		return (is_taken, msg)
+
+	if current_arch.is_call(insn):
+		target_address = int(insn.operands[-1].split()[0], 16)
+		msg = []
+		for i, new_insn in enumerate(capstone_disassemble(target_address, nb_insn)):
+			msg.append("   {}  {}".format (DOWN_ARROW if i==0 else " ", str(new_insn)))
+		return (True, "\n".join(msg))
+
+	return (False, "")
+
+class AARCH64(Architecture):
+	arch = "ARM64"
+	mode = "ARM"
+	
+	flag_register = "cpsr"
+
+	flags_table = {
+		31: "negative",
+		30: "zero",
+		29: "carry",
+		28: "overflow",
+		7: "interrupt",
+		6: "fast"
+	}
+	
+	all_registers = [
+		"x0",  "x1",  "x2",  "x3",  "x4",  "x5",  "x6",  "x7",
+		"x8",  "x9",  "x10", "x11", "x12", "x13", "x14", "x15",
+		"x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23",
+		"x24", "x25", "x26", "x27", "x28", "x29", "x30", "sp",
+		"pc", "cpsr"]
+
+	branches = {
+		"b."	: "Branch conditionally to a label at a PC-relative offset, with a hint that this is not a subroutine call or return.",
+		"cbnz"	: "Compare and Branch on Nonzero compares the value in a register with zero, and conditionally branches to a label at a PC-relative offset if the comparison is not equal.",
+		"cbz"	: "Compare and Branch on Zero compares the value in a register with zero, and conditionally branches to a label at a PC- relative offset if the comparison is equal.",
+		"tbnz"	: "Test bit and Branch if Nonzero compares the value of a bit in a general-purpose register with zero, and conditionally branches to a label at a PC-relative offset if the comparison is not equal.",
+		"tbz"	: "Test bit and Branch if Zero compares the value of a test bit with zero, and conditionally branches to a label at a PC- relative offset if the comparison is equal.",
+		}
+	
+	return_register 	 = "x0"
+	syscall_register 	 = "x8"
+	syscall_instructions = "svc"
+	function_parameters  = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+
+	def is_call(self, insn):
+		mnemo = insn.mnemonic
+		call_mnemos = {"bl", "blr"}
+		return mnemo in call_mnemos
+
+	def flag_register_to_human(self, val=None):
+		# http://events.linuxfoundation.org/sites/events/files/slides/KoreaLinuxForum-2014.pdf
+		reg = self.flag_register
+		if not val:
+			val = get_register(reg)
+		return flags_to_human(val, self.flags_table)
+
+	def is_conditional_branch(self, insn):
+		# https://www.element14.com/community/servlet/JiveServlet/previewBody/41836-102-1-229511/ARM.Reference_Manual.pdf
+		# sect. 5.1.1
+		mnemo = insn.mnemonic
+		branch_mnemos = {"cbnz", "cbz", "tbnz", "tbz"}
+		return mnemo.startswith("b.") or mnemo in branch_mnemos
+		
+	def is_branch_taken(self, insn):
+		mnemo, operands = insn.mnemonic, insn.operands
+		flags = dict((self.flags_table[k], k) for k in self.flags_table)
+		val = get_register(self.flag_register)
+		taken, reason = False, ""
+
+		if mnemo in {"cbnz", "cbz", "tbnz", "tbz"}:
+			reg = operands[0]
+			op = get_register(reg)
+			if mnemo=="cbnz":
+				if op!=0: taken, reason = True, "{}!=0".format(reg)
+				else: taken, reason = False, "{}==0".format(reg)
+			elif mnemo=="cbz":
+				if op==0: taken, reason = True, "{}==0".format(reg)
+				else: taken, reason = False, "{}!=0".format(reg)
+			elif mnemo=="tbnz":
+				# operands[1] has one or more white spaces in front, then a #, then the number
+				# so we need to eliminate them
+				i = int(operands[1].strip().lstrip("#"))
+				if (op & 1<<i) != 0: taken, reason = True, "{}&1<<{}!=0".format(reg,i)
+				else: taken, reason = False, "{}&1<<{}==0".format(reg,i)
+			elif mnemo=="tbz":
+				# operands[1] has one or more white spaces in front, then a #, then the number
+				# so we need to eliminate them
+				i = int(operands[1].strip().lstrip("#"))
+				if (op & 1<<i) == 0: taken, reason = True, "{}&1<<{}==0".format(reg,i)
+				else: taken, reason = False, "{}&1<<{}!=0".format(reg,i)
+		
+		if not reason:
+			taken, reason = self.is_branch_taken_arm(insn)
+		return taken, reason
+
+	def is_branch_taken_arm(self, insn):
+		mnemo = insn.mnemonic
+		# ref: http://www.davespace.co.uk/arm/introduction-to-arm/conditional.html
+		flags = dict((self.flags_table[k], k) for k in self.flags_table)
+		val = get_register(self.flag_register)
+		taken, reason = False, ""
+
+		if mnemo.endswith("eq"): taken, reason = bool(val&(1<<flags["zero"])), "Z"
+		elif mnemo.endswith("ne"): taken, reason = not val&(1<<flags["zero"]), "!Z"
+		elif mnemo.endswith("lt"):
+			taken, reason = bool(val&(1<<flags["negative"])) != bool(val&(1<<flags["overflow"])), "N!=V"
+		elif mnemo.endswith("le"):
+			taken, reason = val&(1<<flags["zero"]) or \
+				bool(val&(1<<flags["negative"])) != bool(val&(1<<flags["overflow"])), "Z || N!=V"
+		elif mnemo.endswith("gt"):
+			taken, reason = val&(1<<flags["zero"]) == 0 and \
+				bool(val&(1<<flags["negative"])) == bool(val&(1<<flags["overflow"])), "!Z && N==V"
+		elif mnemo.endswith("ge"):
+			taken, reason = bool(val&(1<<flags["negative"])) == bool(val&(1<<flags["overflow"])), "N==V"
+		elif mnemo.endswith("vs"): taken, reason = bool(val&(1<<flags["overflow"])), "V"
+		elif mnemo.endswith("vc"): taken, reason = not val&(1<<flags["overflow"]), "!V"
+		elif mnemo.endswith("mi"):
+			taken, reason = bool(val&(1<<flags["negative"])), "N"
+		elif mnemo.endswith("pl"):
+			taken, reason = not val&(1<<flags["negative"]), "N==0"
+		elif mnemo.endswith("hi"):
+			taken, reason = val&(1<<flags["carry"]) and not val&(1<<flags["zero"]), "C && !Z"
+		elif mnemo.endswith("ls"):
+			taken, reason = not val&(1<<flags["carry"]) or val&(1<<flags["zero"]), "!C || Z"
+		return taken, reason
+
+	def disasm(self, address, buffer, pc):
+		cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+		cs.detail   = True
+		
+		for i in cs.disasm(buffer, address):
+			if i.address == pc:
+				msg = ""
+				if self.is_conditional_branch(i):
+					is_taken, msg = capstone_analyze_pc(self, i, len(buffer))
+					msg = f"{RED}->{RST} {i.address:x}{RED} :\t{GRN}{i.mnemonic}{RST}\t{i.op_str}\t [{RED}{msg}{RST}]"
+				else:
+					msg = f"{RED}->{RST} {i.address:x}{RED} :\t{GRN}{i.mnemonic}{RST}\t{i.op_str}\t"
+
+				print(msg)
+			else:
+				print(f"   {i.address:x}{RED} :\t{GRN}{i.mnemonic}{RST}\t{i.op_str}")
+
+class X86_64(Architecture):
+	arch = "X86"
+	mode = "64"
+
+	syscall_register = "rax"
+	syscall_instructions = ["syscall"]
+	
+	flags_table = {
+		6: "zero",
+		0: "carry",
+		2: "parity",
+		4: "adjust",
+		7: "sign",
+		8: "trap",
+		9: "interrupt",
+		10: "direction",
+		11: "overflow",
+		16: "resume",
+		17: "virtualx86",
+		21: "identification",
+	}
+	
+	flag_register = "eflags"
+
+	special_registers = ["cs", "ss", "ds", "es", "fs", "gs"]
+
+	gpr_registers = [
+		"rax", "rbx", "rcx", "rdx", "rsp", "rbp", "rsi", "rdi", "rip",
+		"r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", ]
+	all_registers = gpr_registers + [ flag_register] + special_registers
+
+	function_parameters = ["$rdi", "$rsi", "$rdx", "$rcx", "$r8", "$r9"]
+
+	def flag_register_to_human(self, val=None):
+		reg = self.flag_register
+		if not val:
+			val = get_register(reg)
+		return flags_to_human(val, self.flags_table)
+
+	def is_call(self, insn):
+		mnemo = insn.mnemonic
+		call_mnemos = {"call", "callq"}
+		return mnemo in call_mnemos
+
+	def is_ret(self, insn):
+		return insn.mnemonic == "ret"
+
+	def is_conditional_branch(self, insn):
+		mnemo = insn.mnemonic
+		branch_mnemos = {
+			"ja", "jnbe", "jae", "jnb", "jnc", "jb", "jc", "jnae", "jbe", "jna",
+			"jcxz", "jecxz", "jrcxz", "je", "jz", "jg", "jnle", "jge", "jnl",
+			"jl", "jnge", "jle", "jng", "jne", "jnz", "jno", "jnp", "jpo", "jns",
+			"jo", "jp", "jpe", "js"
+		}
+		return mnemo in branch_mnemos
+
+	def is_branch_taken(self, insn):
+		mnemo = insn.mnemonic
+		# all kudos to fG! (https://github.com/gdbinit/Gdbinit/blob/master/gdbinit#L1654)
+		flags = dict((self.flags_table[k], k) for k in self.flags_table)
+		val = get_register(self.flag_register)
+
+		taken, reason = False, ""
+
+		if mnemo in ("ja", "jnbe"):
+			taken, reason = not val&(1<<flags["carry"]) and not val&(1<<flags["zero"]), "!C && !Z"
+		elif mnemo in ("jae", "jnb", "jnc"):
+			taken, reason = not val&(1<<flags["carry"]), "!C"
+		elif mnemo in ("jb", "jc", "jnae"):
+			taken, reason = val&(1<<flags["carry"]), "C"
+		elif mnemo in ("jbe", "jna"):
+			taken, reason = val&(1<<flags["carry"]) or val&(1<<flags["zero"]), "C || Z"
+		elif mnemo in ("jcxz", "jecxz", "jrcxz"):
+			cx = get_register("$rcx") if self.mode == 64 else get_register("$ecx")
+			taken, reason = cx == 0, "!$CX"
+		elif mnemo in ("je", "jz"):
+			taken, reason = val&(1<<flags["zero"]), "Z"
+		elif mnemo in ("jne", "jnz"):
+			taken, reason = not val&(1<<flags["zero"]), "!Z"
+		elif mnemo in ("jg", "jnle"):
+			taken, reason = not val&(1<<flags["zero"]) and bool(val&(1<<flags["overflow"])) == bool(val&(1<<flags["sign"])), "!Z && S==O"
+		elif mnemo in ("jge", "jnl"):
+			taken, reason = bool(val&(1<<flags["sign"])) == bool(val&(1<<flags["overflow"])), "S==O"
+		elif mnemo in ("jl", "jnge"):
+			taken, reason = val&(1<<flags["overflow"]) != val&(1<<flags["sign"]), "S!=O"
+		elif mnemo in ("jle", "jng"):
+			taken, reason = val&(1<<flags["zero"]) or bool(val&(1<<flags["overflow"])) != bool(val&(1<<flags["sign"])), "Z || S!=O"
+		elif mnemo in ("jo",):
+			taken, reason = val&(1<<flags["overflow"]), "O"
+		elif mnemo in ("jno",):
+			taken, reason = not val&(1<<flags["overflow"]), "!O"
+		elif mnemo in ("jpe", "jp"):
+			taken, reason = val&(1<<flags["parity"]), "P"
+		elif mnemo in ("jnp", "jpo"):
+			taken, reason = not val&(1<<flags["parity"]), "!P"
+		elif mnemo in ("js",):
+			taken, reason = val&(1<<flags["sign"]), "S"
+		elif mnemo in ("jns",):
+			taken, reason = not val&(1<<flags["sign"]), "!S"
+		return taken, reason
+
+	def disasm(self, address, buffer, pc):
+		cs = Cs(CS_ARCH_X86, CS_MODE_64)
+		cs.detail   = True
+
+		for i in cs.disasm(buffer, address):
+			print(f"{address:x}{RED}:\t{GRN}{i.mnemonic}{RST}\t{i.op_str}")
+			if i.address == pc:
+				msg = ""
+				if self.is_conditional_branch(i):
+					is_taken, msg = capstone_analyze_pc(self, i, len(buffer))
+					msg = f"{RED}->{RST} {i.address:x}{RED} :\t{GRN}{i.mnemonic}{RST}\t{i.op_str}\t {RED} [{msg}]{RST}"
+				else:
+					msg = f"{RED}->{RST} {i.address:x}{RED} :\t{GRN}{i.mnemonic}{RST}\t{i.op_str}\t"
+
+				print(msg)
+			else:
+				print(f"   {i.address:x}{RED} :\t{GRN}{i.mnemonic}{RST}\t{i.op_str}")
 
 #################################################################################
 ############################ COMMANDS ###########################################
 #################################################################################
+
+def process_is_alive(f):
+	@functools.wraps(f)
+	def wrapper(*args, **kwargs):
+		target  = lldb.debugger.GetSelectedTarget()
+		process = target.process
+		if process.is_alive:
+			return f(*args, **kwargs)
+		else:
+			warnlog("Target is not running :( ")
+	return wrapper
+
 class ASLRCommand(LLDBCommand):
 	def name(self):
 		return "aslr"
@@ -2153,11 +2570,13 @@ class ASLRCommand(LLDBCommand):
 		
 		else:
 			if arguments[0]=="off":
+				# set eLaunchFlagDisableASLR flag
 				flags |= (lldb.eLaunchFlagDisableASLR)
 				launchInfo.SetLaunchFlags(flags)
 				lldb.debugger.GetSelectedTarget().SetLaunchInfo(launchInfo)
 
 			elif arguments[0]=="on":
+				# clear the eLaunchFlagDisableASLR flag
 				flags &= ~(lldb.eLaunchFlagDisableASLR)
 				launchInfo.SetLaunchFlags(flags)
 				lldb.debugger.GetSelectedTarget().SetLaunchInfo(launchInfo)
@@ -2186,21 +2605,21 @@ class ChecksecCommand(LLDBCommand):
 		mach.parse(arguments[0])
 		mach.content.checksec()
 
-class ReadMachoCommand(LLDBCommand):
+class DisplayMachoHeaderCommand(LLDBCommand):
 	def name(self):
-		return "macho"
+		return "show_header"
 	
 	def description(self):
-		return "Dump Macho-O headers"
+		return "Dump Mach-O headers"
 	
 	def args(self):
 		return [
 			CommandArgument(
 				arg="macho",
 				type="str",
-				help="Path to mach-o binary. Usage: macho /usr/bin/qlmanage or macho",
+				help="Path to mach-o binary. Usage: show_header /usr/bin/qlmanage or macho",
 			)
-		]	
+		]
 	
 	def run(self, arguments, option):
 		if arguments[0] == False:
@@ -2210,31 +2629,127 @@ class ReadMachoCommand(LLDBCommand):
 		mach.parse(arguments[0])
 		mach.content.dump_header()
 
-class BreakOnMainCommand(LLDBCommand):
+class DisplayMachoLoadCmdCommand(LLDBCommand):
 	def name(self):
-		return "bmain"
+		return "show_lc"
 	
 	def description(self):
-		return "Break on main"
+		return "Dump Load Commands from Mach-O"
 
 	def args(self):
 		return [
-		]	
+			CommandArgument(
+				arg="macho",
+				type="str",
+				help="Path to mach-o binary. Usage: show_lc /usr/bin/qlmanage or macho",
+			)
+		]
 	
 	def run(self, arguments, option):
-		if arguments[0]==False:
-			path = lldb.debugger.GetSelectedTarget().GetExecutable().fullpath
-			mach = MachOBinary(path, lldb.debugger)
-			mach.macho.display_headers()
-		else:
-			MachOBinary(arguments[0], lldb.debugger)
+		if arguments[0] == False:
+			arguments[0] = lldb.debugger.GetSelectedTarget().GetExecutable().fullpath
+		
+		mach = Mach(lldb.debugger)
+		mach.parse(arguments[0])
+		mach.content.dump_load_commands()
 
-def exploitable(debugger,cmd,res,dict):
-	"""checks if the crash is exploitable"""
-	Lisa(debugger)
+class CapstoneDisassembleCommand(LLDBCommand):
+	def name(self):
+		return "csdis"
+	
+	def description(self):
+		return "Disassemble buffer at a given pointer using Capstone"
+
+	def args(self):
+		return [
+			CommandArgument(
+				arg="pointer",
+				type="int",
+				help="Pointer to buffer to disassemble",
+			),
+			CommandArgument(
+				arg="length",
+				type="int",
+				help="length of buffer to disassemble",
+			)
+		]
+	
+	@process_is_alive
+	def run(self, arguments, option):
+		target 	= lldb.debugger.GetSelectedTarget()
+		process = target.process
+		thread 	= process.selected_thread
+		frame 	= thread.GetFrameAtIndex(0)
+		address	= frame.pc
+
+		if arguments[0]:
+			address = int(arguments[0], 16)
+		
+		length = 32
+		if arguments[1]:
+			if "0x" in arguments[1][:2]:
+				length = int(arguments[1], 16)
+			else:
+				length = int(arguments[1])
+
+		error = lldb.SBError()
+		buffer = process.ReadMemory(address, length, error)
+
+		arch = get_target_arch()
+		if arch:
+			arch.disasm(address, buffer, frame.pc)
+
+class ContextCommand(LLDBCommand):
+	def name(self):
+		return "context"
+	
+	def description(self):
+		return "Display given thread or selected thread context"
+
+	def args(self):
+		return [
+			CommandArgument(
+				arg="thread",
+				type="int",
+				help="thread id",
+			)
+		]
+	
+	@process_is_alive
+	def run(self, arguments, option):
+		target 	= lldb.debugger.GetSelectedTarget()
+		process = target.process
+
+		if not arguments[0]:
+			# thread 	= process.selected_thread 
+			for thread in process.threads:
+				if thread.GetStopReason() != lldb.eStopReasonNone and thread.GetStopReason() != lldb.eStopReasonInvalid:
+					self.print_thread_context(thread, process)
+
+		else:
+			thread_id = int(arguments[0], 16) - 1 
+			thread	  = process.GetThreadAtIndex(thread_id)
+			self.print_thread_context(thread, process)
+
+	def print_thread_context(self, thread, process):
+		context_title(f"thread #{thread.idx}")
+		frame 	= thread.GetFrameAtIndex(0)
+		address	= frame.pc
+		
+		length = 32
+
+		error = lldb.SBError()
+		buffer = process.ReadMemory(address, length, error)
+
+		arch = get_target_arch()
+
+		if arch:
+			arch.disasm(address, buffer, frame.pc)
 
 def __lldb_init_module(debugger, dict):
-	dlog(" == lisa == ")
+	context_title(" lisa ")
+
+	global command_iterpreter
 
 	res = lldb.SBCommandReturnObject()
 	command_iterpreter = debugger.GetCommandInterpreter()
@@ -2245,7 +2760,11 @@ def __lldb_init_module(debugger, dict):
 	current_module = sys.modules[__name__]
 	current_module._loadedFunctions = {}
 
-	loadCommand(current_module, ASLRCommand(), "lisa")
-	loadCommand(current_module, ChecksecCommand(), "lisa")
-	loadCommand(current_module, ReadMachoCommand(), "lisa")
-	
+	load_command(current_module, ASLRCommand(), "lisa")
+	load_command(current_module, ChecksecCommand(), "lisa")
+	load_command(current_module, DisplayMachoHeaderCommand(), "lisa")
+	load_command(current_module, DisplayMachoLoadCmdCommand(), "lisa")
+	load_command(current_module, CapstoneDisassembleCommand(), "lisa")
+	load_command(current_module, ContextCommand(), "lisa")
+
+	command_iterpreter.HandleCommand("target stop-hook add --one-liner 'context'", res)

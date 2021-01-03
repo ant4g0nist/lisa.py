@@ -2,6 +2,16 @@
 	- An Exploit Dev Swiss Army Knife. 
 
 # Commands
+```
+  aslr        -- View/modify ASLR setting of target.
+  checksec    -- Display the security properties of the current executable
+  context     -- Display given thread or selected thread context
+  csdis       -- Disassemble buffer at a given pointer using Capstone
+  show_header -- Dump Mach-O headers
+  show_lc     -- Dump Load Commands from Mach-O
+```
+
+# Commands in Detail
 * aslr		- View/modify ASLR setting of target.
 ```
 (lisa:>) help aslr
@@ -25,6 +35,7 @@ ASLR : on
 ASLR : off
 (lisa:>) 
 ```
+
 * checksec	- Display the security properties of an executable
 ```
 (lisa:>) checksec 
@@ -50,3 +61,4 @@ NX Stack 	 : True
 Restricted 	 : True (Authority=Software Signing)
 (lisa:>) 
 ```
+
