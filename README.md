@@ -5,8 +5,11 @@
 ```
   aslr        -- View/modify ASLR setting of target.
   checksec    -- Display the security properties of the current executable
-  context     -- Display given thread or selected thread context
+  context     -- Display context of given thread or selected thread by default. Usage: 'context all' or 'context 1'
   csdis       -- Disassemble buffer at a given pointer using Capstone
+  pmem        -- Visualize memory at a given address and size
+  pstack      -- Visualize stack for a given frame or selected frame by default
+  rr          -- Display registers for a given thread and frame or selected thread and selected frame by default
   show_header -- Dump Mach-O headers
   show_lc     -- Dump Load Commands from Mach-O
 ```
@@ -62,3 +65,9 @@ Restricted 	 : True (Authority=Software Signing)
 (lisa:>) 
 ```
 
+### Credits
+
+- [lldb](https://lldb.llvm.org/)
+- [chisel](https://github.com/facebook/chisel)
+- [gef](https://github.com/hugsy/gef)
+- [pixd](https://github.com/moreati/python-pixd)
