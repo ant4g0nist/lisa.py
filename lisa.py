@@ -2162,11 +2162,15 @@ def run_command_return_output(debugger,lldb_command, result, dict):
 	error = res.GetError()
 	return (output,error)
 
-def get_register(reg):
-	target 	= lldb.debugger.GetSelectedTarget()
-	process = target.process
-	thread	= process.GetSelectedThread()
-	frame	= thread.GetSelectedFrame()
+def get_register(reg, frame=None):
+	if frame==None:
+		target 	= lldb.debugger.GetSelectedTarget()
+		process = target.process
+		thread	= process.GetSelectedThread()
+		frame	= thread.GetSelectedFrame()
+
+	if type(reg)==capstone.arm64.Arm64Op:
+		reg = insn.reg_name(reg.reg)
 
 	if reg=="pc":
 		return frame.pc
@@ -2176,15 +2180,14 @@ def get_register(reg):
 	
 	if reg=="fp":
 		return frame.fp
-	
-	if type(reg)==capstone.arm64.Arm64Op:
-		reg = reg.value
-	
-	result = ""
-	output,error = run_command_return_output(lldb.debugger, 'register read '+reg, result, dict)
+		
+	result = 0
+	registers = frame.GetRegisters()
+	for value in registers:
+		for child in value:
+			if child.GetName().lower() == reg.lower():
+				return int(child.value,16)
 
-	return int(output.split("= ")[-1].split(" ")[0], 16)
-	
 def flags_to_human(reg_value, value_table):
 	"""Return a human readable string showing the flag states."""
 	flags = []
@@ -2362,9 +2365,15 @@ class AARCH64(Architecture):
 		flags = dict((self.flags_table[k], k) for k in self.flags_table)
 		val = get_register(self.flag_register)
 		taken, reason = False, ""
-
-		if mnemo.endswith("eq"): taken, reason = bool(val&(1<<flags["zero"])), "Z"
-		elif mnemo.endswith("ne"): taken, reason = not val&(1<<flags["zero"]), "!Z"
+		
+		if mnemo.endswith("eq"):
+			taken, reason = bool(val&(1<<flags["zero"])), "Z"
+		elif mnemo.endswith("hs"):
+			taken, reason = val & (1<<flags["carry"]), "C==1"
+		elif mnemo.endswith("lo"):
+			taken, reason = not val & (1<<flags["carry"]), "C==0"
+		elif mnemo.endswith("ne"):
+			taken, reason = not val&(1<<flags["zero"]), "!Z"
 		elif mnemo.endswith("lt"):
 			taken, reason = bool(val&(1<<flags["negative"])) != bool(val&(1<<flags["overflow"])), "N!=V"
 		elif mnemo.endswith("le"):
@@ -2375,8 +2384,10 @@ class AARCH64(Architecture):
 				bool(val&(1<<flags["negative"])) == bool(val&(1<<flags["overflow"])), "!Z && N==V"
 		elif mnemo.endswith("ge"):
 			taken, reason = bool(val&(1<<flags["negative"])) == bool(val&(1<<flags["overflow"])), "N==V"
-		elif mnemo.endswith("vs"): taken, reason = bool(val&(1<<flags["overflow"])), "V"
-		elif mnemo.endswith("vc"): taken, reason = not val&(1<<flags["overflow"]), "!V"
+		elif mnemo.endswith("vs"):
+			taken, reason = bool(val&(1<<flags["overflow"])), "V"
+		elif mnemo.endswith("vc"):
+			taken, reason = not val&(1<<flags["overflow"]), "!V"
 		elif mnemo.endswith("mi"):
 			taken, reason = bool(val&(1<<flags["negative"])), "N"
 		elif mnemo.endswith("pl"):
@@ -2404,6 +2415,16 @@ class AARCH64(Architecture):
 			else:
 				print(f"   {i.address:x}{RED} :\t{GRN}{i.mnemonic}{RST}\t{i.op_str}")
 
+	def print_registers(self, frame):
+		print("$x0  : 0x%016x   $x1  : 0x%016x    $x2 : 0x%016x    $x3 : 0x%016x"%(get_register("X0"), get_register("X1"), get_register("X2"), get_register("X3")))
+		print("$x4  : 0x%016x   $x5  : 0x%016x    $x6 : 0x%016x    $x7 : 0x%016x"%(get_register("X4"), get_register("X5"), get_register("X6"), get_register("X7")))
+		print("$x8  : 0x%016x   $x9  : 0x%016x   $x10 : 0x%016x   $x11 : 0x%016x"%(get_register("X8"), get_register("X9"), get_register("X10"), get_register("X11")))
+		print("$x12 : 0x%016x   $x13 : 0x%016x   $x14 : 0x%016x   $x15 : 0x%016x"%(get_register("X12"), get_register("X13"), get_register("X14"), get_register("X15")))
+		print("$x18 : 0x%016x   $x19 : 0x%016x   $x20 : 0x%016x   $x21 : 0x%016x"%(get_register("X18"), get_register("X23"), get_register("X24"), get_register("X25")))
+		print("$x26 : 0x%016x   $x27 : 0x%016x   $x28 : 0x%016x   "%(get_register("X26"), get_register("X27"), get_register("X28")))
+		print("$fp  : 0x%016x    $lr : 0x%016x    $pc : 0x%016x"%(get_register("FP"), get_register("LR"), get_register("PC")))
+		print("CPSR : 0x%016x    "%(get_register("CPSR")))
+		
 class X8664(Architecture):
 	arch = "X86"
 	mode = "64"
@@ -2703,14 +2724,14 @@ class ContextCommand(LLDBCommand):
 		return "context"
 	
 	def description(self):
-		return "Display given thread or selected thread context"
+		return "Display context of given thread or selected thread by default. Usage: 'context all' or 'context 1'"
 
 	def args(self):
 		return [
 			CommandArgument(
 				arg="thread",
 				type="int",
-				help="thread id",
+				help="thread id or all.",
 			)
 		]
 	
@@ -2719,15 +2740,19 @@ class ContextCommand(LLDBCommand):
 		target 	= lldb.debugger.GetSelectedTarget()
 		process = target.process
 
-		if not arguments[0]:
-			# thread 	= process.selected_thread 
+		if arguments[0]=="all":
 			for thread in process.threads:
 				if thread.GetStopReason() != lldb.eStopReasonNone and thread.GetStopReason() != lldb.eStopReasonInvalid:
 					self.print_thread_context(thread, process)
 
+		elif arguments[0]:
+			thread_id = int(arguments[0], 16)
+			thread	  = process.GetThreadByIndexID(thread_id)
+			if thread:
+				self.print_thread_context(thread, process)
+
 		else:
-			thread_id = int(arguments[0], 16) - 1 
-			thread	  = process.GetThreadAtIndex(thread_id)
+			thread = process.GetSelectedThread()
 			self.print_thread_context(thread, process)
 
 	def print_thread_context(self, thread, process):
@@ -2744,7 +2769,57 @@ class ContextCommand(LLDBCommand):
 		arch = get_target_arch()
 
 		if arch:
+			context_title("registers")
+			arch.print_registers(frame)
+			context_title("code")
 			arch.disasm(address, buffer, frame.pc)
+
+class RegisterReadCommand(LLDBCommand):
+	def name(self):
+		return "rr"
+	
+	def description(self):
+		return "Display registers for a given frame, default is for selected frame"
+
+	def args(self):
+		return [
+			CommandArgument(
+				arg="frame",
+				type="int",
+				help="frame id",
+			)
+		]
+	
+	@process_is_alive
+	def run(self, arguments, option):
+		target 	= lldb.debugger.GetSelectedTarget()
+		process = target.process
+		
+		if not arguments[0]:
+			
+			for thread in process.threads:
+				if thread.GetStopReason() != lldb.eStopReasonNone and thread.GetStopReason() != lldb.eStopReasonInvalid:
+					self.print_registers(thread, process)
+
+		else:
+			thread_id = int(arguments[0], 16)
+			thread	  = process.GetThreadByIndexID(thread_id)
+			if thread:
+				self.print_registers(thread, process)
+
+	def print_registers(self, thread, process):
+		context_title(f"thread #{thread.idx}")
+
+		frame 	= thread.GetFrameAtIndex(0)
+		address	= frame.pc
+		
+		length = 32
+
+		error = lldb.SBError()
+		buffer = process.ReadMemory(address, length, error)
+
+		arch = get_target_arch()
+		arch.print_registers(frame)
 
 def __lldb_init_module(debugger, dict):
 	context_title(" lisa ")
@@ -2766,5 +2841,6 @@ def __lldb_init_module(debugger, dict):
 	load_command(current_module, DisplayMachoLoadCmdCommand(), "lisa")
 	load_command(current_module, CapstoneDisassembleCommand(), "lisa")
 	load_command(current_module, ContextCommand(), "lisa")
+	load_command(current_module, RegisterReadCommand(), "lisa")
 
 	command_iterpreter.HandleCommand("target stop-hook add --one-liner 'context'", res)
