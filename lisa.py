@@ -408,8 +408,8 @@ def hexdump(buf, address):
 		print(LINE_FORMATTER.format(row, hexbytes, printable))
 		
 		row += 0x10
-		line = buf[cur:cur+16]
 		cur += 0x10
+		line = buf[cur:cur+16]
 	
 	print(FOOTER)
 
