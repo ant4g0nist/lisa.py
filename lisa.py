@@ -340,7 +340,7 @@ def format_offset(offset):
 	"""
 	return '0x%5x%03x' % (offset >> 12, offset & 0xFFF)
 
-def hexdump(buffer, start=0, end=None, columns=64):
+def visual_hexdump(buffer, start=0, end=None, columns=64):
 	"""Print a colorful representation of binary data using terminal ESC codes
 	"""
 	count = (end or -1) - start
@@ -365,7 +365,53 @@ def hexdump(buffer, start=0, end=None, columns=64):
 				else:
 					print('\x1B[38;2;%d;%d;%dm\x1B[48;2;%d;%d;%dm▀' % (expand(colormap[buf[i + j]]) + expand(colormap[buf[i + j + columns]])), end='')
 			print('\x1B[m')
+
 		read += len(buf)
+
+HEADER = '┌────────────────┬─────────────────────────┬─────────────────────────┬────────┬────────┐'
+FOOTER = RST+'└────────────────┴─────────────────────────┴─────────────────────────┴────────┴────────┘'
+LINE_FORMATTER = '│' + '' + '{:016x}' + '│ {}' + '│{}'  + '│'
+
+def hexmod(b: int) -> str:
+	'''10 -> "0xa" -> "0a"'''
+	return hex(b)[2:].rjust(2, '0')
+
+def colored(b: int) -> (str, str):
+	ch = chr(b)
+	hx = hexmod(b)
+	if '\x00' == ch:
+		return RST + hx , RST + "."
+	elif ch in string.ascii_letters + string.digits + string.punctuation:
+		return CYN + hx, CYN + ch
+	elif ch in string.whitespace:
+		return GRN + hx, ' ' if ' ' == ch else GRN + '_'
+	return YEL + hx, YEL + '.'
+
+def hexdump(buf, address):
+	cache = {hexmod(b): colored(b) for b in range(256)} #0x00 - 0xff
+	cache['  '] = ('  ', ' ')
+
+	print(HEADER)
+	cur = 0
+	row = address
+	line = buf[cur:cur+16]
+	while line:
+		line_hex = line.hex().ljust(32)
+
+		hexbytes = ''
+		printable = ''
+		for i in range(0, len(line_hex), 2):
+			hbyte, abyte = cache[line_hex[i:i+2]]
+			hexbytes += hbyte + ' ' if i != 14 else hbyte + ' ┊ '
+			printable += abyte if i != 14 else abyte + '┊'
+
+		print(LINE_FORMATTER.format(row, hexbytes, printable))
+		
+		row += 0x10
+		line = buf[cur:cur+16]
+		cur += 0x10
+	
+	print(FOOTER)
 
 def swap_unpack_char():
 	"""Returns the unpack prefix that will for non-native endian-ness."""
@@ -381,10 +427,9 @@ def dump_hex_bytes(addr, s, bytes_per_line=8):
 			if line:
 				print(line)
 			line = '%#8.8x: ' % (addr + i)
-		line += "0x%02x " % ch
+		line += "%02x " % ch
 		i += 1
 	print(line)
-
 
 def dump_hex_byte_string_diff(addr, a, b, bytes_per_line=16):
 	i = 0
@@ -424,22 +469,22 @@ def dump_hex_byte_string_diff(addr, a, b, bytes_per_line=16):
 	print(line)
 
 def evaluateInputExpression(expression, printErrors=True):
-    # HACK
-    frame = (
-        lldb.debugger.GetSelectedTarget()
-        .GetProcess()
-        .GetSelectedThread()
-        .GetSelectedFrame()
-    )
-    options = lldb.SBExpressionOptions()
-    options.SetTrapExceptions(False)
-    value = frame.EvaluateExpression(expression, options)
-    error = value.GetError()
+	# HACK
+	frame = (
+		lldb.debugger.GetSelectedTarget()
+		.GetProcess()
+		.GetSelectedThread()
+		.GetSelectedFrame()
+	)
+	options = lldb.SBExpressionOptions()
+	options.SetTrapExceptions(False)
+	value = frame.EvaluateExpression(expression, options)
+	error = value.GetError()
 
-    if printErrors and error.Fail():
-        print(error)
+	if printErrors and error.Fail():
+		print(error)
 
-    return value
+	return value
 
 class FileExtract:
 	'''Decode binary data from a file'''
@@ -2977,7 +3022,8 @@ class DisplayStackCommand(LLDBCommand):
 		buffer = process.ReadMemory(address, stack_size, error)
 
 		arch = get_target_arch()
-		hexdump(buffer, start=address, end=address+stack_size, columns=16)
+		if buffer:
+			visual_hexdump(buffer, start=address, end=address+stack_size, columns=16)
 
 class DisplayMemoryCommand(LLDBCommand):
 	def name(self):
@@ -3022,7 +3068,54 @@ class DisplayMemoryCommand(LLDBCommand):
 		buffer = process.ReadMemory(address, size, error)
 
 		arch = get_target_arch()
-		hexdump(buffer, start=address, end=address+size, columns=16)
+		if buffer:
+			visual_hexdump(buffer, start=address, end=address+size, columns=16)
+
+class ReadMemoryCommand(LLDBCommand):
+	def name(self):
+		return "rmem"
+
+	def description(self):
+		return "Hexdump memory at a given address and size"
+
+	def args(self):
+		return [
+			CommandArgument(
+				arg="start",
+				type="int",
+				help="start of memory to display",
+				default=64
+			),
+			CommandArgument(
+				arg="size",
+				type="int",
+				help="size of memory to display",
+			)
+		]
+	
+	@process_is_alive
+	def run(self, arguments, option):
+		target 	= lldb.debugger.GetSelectedTarget()
+		process = target.process
+
+		if arguments[0]!=False and arguments[1]!=False:
+			if "$" == arguments[0][0]:
+				address = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
+			else:
+				address  = to_int(arguments[0])
+			size 	 = to_int(arguments[1])
+
+			if address and size:
+				self.print_memory(address, size, process)
+
+	def print_memory(self, address, size, process):
+
+		error = lldb.SBError()
+		buffer = process.ReadMemory(address, size, error)
+
+		arch = get_target_arch()
+		if buffer:
+			hexdump(buffer, address)
 
 def __lldb_init_module(debugger, dict):
 	context_title(" lisa ")
@@ -3047,5 +3140,7 @@ def __lldb_init_module(debugger, dict):
 	load_command(current_module, RegisterReadCommand(), "lisa")
 	load_command(current_module, DisplayStackCommand(), "lisa")
 	load_command(current_module, DisplayMemoryCommand(), "lisa")
+	load_command(current_module, ReadMemoryCommand(), "lisa")
+	
 	
 	command_iterpreter.HandleCommand("target stop-hook add --one-liner 'context'", res)
