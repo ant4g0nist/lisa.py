@@ -7,6 +7,7 @@
   checksec    -- Display the security properties of the current executable
   context     -- Display context of given thread or selected thread by default. Usage: 'context all' or 'context 1'
   csdis       -- Disassemble buffer at a given pointer using Capstone
+  pbt         -- Pretty print backtrace
   pmem        -- Visualize memory at a given address and size
   pstack      -- Visualize stack for a given frame or selected frame by default
   rmem        -- Hexdump memory at a given address and size

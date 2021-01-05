@@ -53,7 +53,7 @@ def context_title(m):
 	msg_color = GRN
 
 	if not m:
-		print(Color.colorify(HORIZONTAL_LINE * tty_columns, line_color))
+		print(f"{line_color}{HORIZONTAL_LINE * tty_columns} {line_color}{RST}")
 		return
 
 	trail_len = len(m) + 8
@@ -85,7 +85,7 @@ def get_target_triple():
 
 def get_target_arch():
 	arch = lldb.debugger.GetSelectedTarget().triple.split('-')[0]
-	if arch == "arm64":
+	if arch == "arm64" or arch=="arm64e":
 		return AARCH64()
 	elif arch == "x86_64":
 		return X8664()
@@ -2281,6 +2281,7 @@ class Mach:
 			'''Dump all mach-o symbols in the symbol table'''
 			self.mach.dump_symtab(True, self.options)
 			return False
+
 #################################################################################
 ############################ ARCH definition ####################################
 #################################################################################
@@ -2296,8 +2297,17 @@ def run_command_return_output(debugger,lldb_command, result, dict):
 	error = res.GetError()
 	return (output,error)
 
+def get_pc_addresses(thread):
+	"""
+	Returns a sequence of pc addresses for this thread.
+	"""
+	def GetPCAddress(i):
+		return thread.GetFrameAtIndex(i).GetPCAddress()
+
+	return list(map(GetPCAddress, list(range(thread.GetNumFrames()))))
+
 def get_register(reg, frame=None):
-	if frame==None:
+	if not frame:
 		target 	= lldb.debugger.GetSelectedTarget()
 		process = target.process
 		thread	= process.GetSelectedThread()
@@ -2316,8 +2326,11 @@ def get_register(reg, frame=None):
 	registers = frame.GetRegisters()
 	for value in registers:
 		for child in value:
-			if child.GetName().lower() == reg.lower():
+			if child.GetName().lower() == reg.lower() and child.value:
 				return int(child.value,16)
+
+			if not child.value and child.GetName().lower() == reg.lower():
+				return 0xffff_ffff_ffff_ffff
 
 def flags_to_human(reg_value, value_table):
 	"""Return a human readable string showing the flag states."""
@@ -2548,14 +2561,14 @@ class AARCH64(Architecture):
 				print(f"   {i.address:x}{RED} :\t{GRN}{i.mnemonic}{RST}\t{i.op_str}")
 
 	def print_registers(self, frame):
-		print("$x0  : 0x%016x   $x1  : 0x%016x    $x2 : 0x%016x    $x3 : 0x%016x"%(get_register("X0"), get_register("X1"), get_register("X2"), get_register("X3")))
-		print("$x4  : 0x%016x   $x5  : 0x%016x    $x6 : 0x%016x    $x7 : 0x%016x"%(get_register("X4"), get_register("X5"), get_register("X6"), get_register("X7")))
-		print("$x8  : 0x%016x   $x9  : 0x%016x   $x10 : 0x%016x   $x11 : 0x%016x"%(get_register("X8"), get_register("X9"), get_register("X10"), get_register("X11")))
-		print("$x12 : 0x%016x   $x13 : 0x%016x   $x14 : 0x%016x   $x15 : 0x%016x"%(get_register("X12"), get_register("X13"), get_register("X14"), get_register("X15")))
-		print("$x18 : 0x%016x   $x19 : 0x%016x   $x20 : 0x%016x   $x21 : 0x%016x"%(get_register("X18"), get_register("X23"), get_register("X24"), get_register("X25")))
-		print("$x26 : 0x%016x   $x27 : 0x%016x   $x28 : 0x%016x   "%(get_register("X26"), get_register("X27"), get_register("X28")))
-		print("$fp  : 0x%016x    $lr : 0x%016x    $pc : 0x%016x"%(get_register("FP"), get_register("LR"), get_register("PC")))
-		print("CPSR : 0x%016x    "%(get_register("CPSR")))
+		print("$x0  : 0x%016x   $x1  : 0x%016x    $x2 : 0x%016x    $x3 : 0x%016x"%(get_register("X0", frame),  get_register("X1", frame),  get_register("X2", frame),  get_register("X3", frame)))
+		print("$x4  : 0x%016x   $x5  : 0x%016x    $x6 : 0x%016x    $x7 : 0x%016x"%(get_register("X4", frame),  get_register("X5", frame),  get_register("X6", frame),  get_register("X7", frame)))
+		print("$x8  : 0x%016x   $x9  : 0x%016x   $x10 : 0x%016x   $x11 : 0x%016x"%(get_register("X8", frame),  get_register("X9", frame),  get_register("X10", frame),  get_register("X11", frame)))
+		print("$x12 : 0x%016x   $x13 : 0x%016x   $x14 : 0x%016x   $x15 : 0x%016x"%(get_register("X12", frame),  get_register("X13", frame),  get_register("X14", frame),  get_register("X15", frame)))
+		print("$x18 : 0x%016x   $x19 : 0x%016x   $x20 : 0x%016x   $x21 : 0x%016x"%(get_register("X18", frame),  get_register("X23", frame),  get_register("X24", frame),  get_register("X25", frame)))
+		print("$x26 : 0x%016x   $x27 : 0x%016x   $x28 : 0x%016x   "%(get_register("X26", frame),  get_register("X27", frame),  get_register("X28", frame)))
+		print("$fp  : 0x%016x    $lr : 0x%016x    $pc : 0x%016x"%(get_register("FP", frame),  get_register("LR", frame),  get_register("PC", frame)))
+		print("CPSR : 0x%016x    "%(get_register("CPSR", frame)))
 		
 class X8664(Architecture):
 	arch = "X86"
@@ -2891,7 +2904,8 @@ class ContextCommand(LLDBCommand):
 		print()
 		context_title(f"thread #{thread.idx}")
 
-		frame 	= thread.GetFrameAtIndex(0)
+		frame 	= thread.GetSelectedFrame()
+
 		address	= frame.pc
 		
 		length = 32
@@ -3117,6 +3131,59 @@ class ReadMemoryCommand(LLDBCommand):
 		if buffer:
 			hexdump(buffer, address)
 
+class PrettyBacktraceCommand(LLDBCommand):
+	def name(self):
+		return "pbt"
+
+	def description(self):
+		return "Pretty print backtrace"
+	
+	def args(self):
+		return []
+
+	def run(self, arguments, option):
+		target 	= lldb.debugger.GetSelectedTarget()
+		process = target.GetProcess()
+		thread	= process.GetSelectedThread()
+		sframe	= thread.GetSelectedFrame()
+		addrs   = get_pc_addresses(thread)
+
+		frames	=	thread.GetNumFrames()
+		thread_info = f"thread {RED}#{thread.idx}{RST}"
+		
+		if thread.queue:
+			thread_info = f"{thread_info} queue = {GRN}'{thread.queue}'{RST}"
+		
+		if thread.GetStopReason() == lldb.eStopReasonException:
+			print(f"{thread_info}, stop reason = {RED}{thread.GetStopDescription(1024)}{RST}")
+		elif thread.GetStopReason() != lldb.eStopReasonNone and thread.GetStopReason() != lldb.eStopReasonInvalid:
+			print(f"{thread_info}, stop reason = {CYN}{thread.GetStopDescription(1024)}{RST}")
+		else:
+			print(f"{thread_info}{YEL}{thread.GetStopDescription(1024)}{RST}")
+
+		for i in range(0, frames):
+			frame 	= thread.GetFrameAtIndex(i)
+
+			file_addr = addrs[i].GetFileAddress()
+			start_addr = frame.GetSymbol().GetStartAddress().GetFileAddress()
+			symbol_offset = file_addr - start_addr
+
+			module	= frame.module
+			libname	= module.platform_file.basename
+			if frame.idx == sframe.idx:
+				print(f"{RED}=>{RST}  frame #{frame.idx:02} ->  {RED}0x{frame.pc:08x}{RST} {CYN}{libname}{RST}`{GRN}{frame.name}{RST} + {symbol_offset}")
+
+				arch = get_target_arch()
+
+				error = lldb.SBError()
+				buffer = process.ReadMemory(frame.pc, 32, error)
+				
+				print(f"{YEL}<disassembly>{RST}")
+				arch.disasm(frame.pc, buffer, frame.pc)
+				print(f"{YEL}</disassembly>{RST}")
+			else:
+				print(f"    frame #{frame.idx:02} ->  {RED}0x{frame.pc:08x}{RST} {CYN}{libname}{RST}`{GRN}{frame.name}{RST} + {symbol_offset}")
+
 def __lldb_init_module(debugger, dict):
 	context_title(" lisa ")
 
@@ -3141,6 +3208,6 @@ def __lldb_init_module(debugger, dict):
 	load_command(current_module, DisplayStackCommand(), "lisa")
 	load_command(current_module, DisplayMemoryCommand(), "lisa")
 	load_command(current_module, ReadMemoryCommand(), "lisa")
-	
+	load_command(current_module, PrettyBacktraceCommand(), "lisa")
 	
 	command_iterpreter.HandleCommand("target stop-hook add --one-liner 'context'", res)
