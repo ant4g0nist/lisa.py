@@ -2689,6 +2689,15 @@ class X8664(Architecture):
 			else:
 				print(f"   {i.address:x}{RED} :\t{GRN}{i.mnemonic}{RST}\t{i.op_str}")
 
+	def print_registers(self, frame):
+		print("$rax : 0x%016x   $rbx : 0x%016x   $rcx : 0x%016x   $rdx : 0x%016x"%(get_register("rax", frame),  get_register("rbx", frame),  get_register("rcx", frame),  get_register("rdx", frame)))
+		print("$r8  : 0x%016x   $r9  : 0x%016x   $r10 : 0x%016x   $r11 : 0x%016x"%(get_register("r8", frame),  get_register("r9", frame),  get_register("r10", frame),  get_register("r11", frame)))
+		print("$r12 : 0x%016x   $r13 : 0x%016x   $r14 : 0x%016x   $r15 : 0x%016x"%(get_register("r12", frame),  get_register("r13", frame),  get_register("r14", frame),  get_register("r15", frame)))
+		print("$rbp : 0x%016x   $rsp : 0x%016x   $rsi : 0x%016x   $rdi : 0x%016x"%(get_register("rbp", frame),  get_register("rsp", frame),  get_register("rsi", frame),  get_register("rdi", frame)))
+		print("$rip : 0x%016x"%(get_register("rip", frame)))
+		print("flags: 0x%016x"%(get_register("rflags", frame)))
+		
+
 #################################################################################
 ############################ COMMANDS ###########################################
 #################################################################################
