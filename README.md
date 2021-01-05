@@ -9,6 +9,7 @@
   csdis       -- Disassemble buffer at a given pointer using Capstone
   pmem        -- Visualize memory at a given address and size
   pstack      -- Visualize stack for a given frame or selected frame by default
+  rmem        -- Hexdump memory at a given address and size
   rr          -- Display registers for a given thread and frame or selected thread and selected frame by default
   show_header -- Dump Mach-O headers
   show_lc     -- Dump Load Commands from Mach-O
