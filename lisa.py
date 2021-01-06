@@ -2857,8 +2857,11 @@ class CapstoneDisassembleCommand(LLDBCommand):
 		address	= frame.pc
 
 		if arguments[0]:
-			address = int(arguments[0], 16)
-		
+			if "$" == arguments[0][0]:
+				address = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
+			else:
+				address = int(arguments[0], 16)
+
 		length = 32
 		if arguments[1]:
 			if "0x" in arguments[1][:2]:
@@ -3048,6 +3051,69 @@ class DisplayStackCommand(LLDBCommand):
 		if buffer:
 			visual_hexdump(buffer, start=address, end=address+stack_size, columns=16)
 
+class DumpStackCommand(LLDBCommand):
+	def name(self):
+		return "rstack"
+
+	def description(self):
+		return "Hexdump stack for a given frame or selected frame by default"
+
+	def args(self):
+		return [
+			CommandArgument(
+				arg="size",
+				type="int",
+				help="stack size to display",
+				default=64
+			),
+			CommandArgument(
+				arg="frame",
+				type="int",
+				help="frame id",
+			),
+			CommandArgument(
+				arg="thread",
+				type="int",
+				help="thread id",
+			)
+		]
+	
+	@process_is_alive
+	def run(self, arguments, option):
+		target 	= lldb.debugger.GetSelectedTarget()
+		process = target.process
+		stack_size = 128
+
+		if arguments[0] != False:
+			stack_size = to_int(arguments[0])
+		
+		if arguments[0]=="all":
+			for thread in process.threads:
+					self.print_stack(stack_size, frame_id, thread, process)
+
+		elif arguments[0]!=False and arguments[1]!=False:
+			frame_id  = to_int(arguments[0])
+			thread_id = to_int(arguments[1])
+			thread	  = process.GetThreadByIndexID(thread_id)
+			if thread:
+				self.print_stack(stack_size, frame_id, thread, process)
+
+		else:
+			thread = process.GetSelectedThread()
+			self.print_stack(stack_size, 0, thread, process)
+
+	def print_stack(self, stack_size, frame_id, thread, process):
+
+		frame 	= thread.GetFrameAtIndex(frame_id)
+		address	= frame.sp
+		
+		error = lldb.SBError()
+		buffer = process.ReadMemory(address, stack_size, error)
+
+		arch = get_target_arch()
+		if buffer:
+			hexdump(buffer, address)
+
 class DisplayMemoryCommand(LLDBCommand):
 	def name(self):
 		return "pmem"
@@ -3179,6 +3245,7 @@ class PrettyBacktraceCommand(LLDBCommand):
 
 			module	= frame.module
 			libname	= module.platform_file.basename
+
 			if frame.idx == sframe.idx:
 				print(f"{RED}=>{RST}  frame #{frame.idx:02} ->  {RED}0x{frame.pc:08x}{RST} {CYN}{libname}{RST}`{GRN}{frame.name}{RST} + {symbol_offset}")
 
@@ -3215,8 +3282,9 @@ def __lldb_init_module(debugger, dict):
 	load_command(current_module, ContextCommand(), "lisa")
 	load_command(current_module, RegisterReadCommand(), "lisa")
 	load_command(current_module, DisplayStackCommand(), "lisa")
+	load_command(current_module, DumpStackCommand(), "lisa")	
 	load_command(current_module, DisplayMemoryCommand(), "lisa")
 	load_command(current_module, ReadMemoryCommand(), "lisa")
 	load_command(current_module, PrettyBacktraceCommand(), "lisa")
-	
+
 	command_iterpreter.HandleCommand("target stop-hook add --one-liner 'context'", res)
