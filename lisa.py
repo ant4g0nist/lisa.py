@@ -170,7 +170,7 @@ def load_command(module, command, filename):
 
 def validate_args_for_command(args, command):
 	if len(args) < len(command.args()):
-		defaultArgs = [arg.required for arg in command.args()]
+		defaultArgs = [arg.default for arg in command.args()]
 		defaultArgsToAppend = defaultArgs[len(args) :]
 
 		index = len(args)
@@ -178,7 +178,7 @@ def validate_args_for_command(args, command):
 			if defaultArg:
 				arg = command.args()[index]
 				print("Whoops! You are missing the <" + arg.argName + "> argument.")
-				print("\nUsage: " + usageForCommand(command))
+				print("\nUsage: " + usage_for_command(command))
 				return
 			index += 1
 
@@ -2332,6 +2332,10 @@ def get_register(reg, frame=None):
 			if not child.value and child.GetName().lower() == reg.lower():
 				return 0xffff_ffff_ffff_ffff
 
+def parse_stopDescription(description):
+	pass
+	
+
 def flags_to_human(reg_value, value_table):
 	"""Return a human readable string showing the flag states."""
 	flags = []
@@ -2543,6 +2547,16 @@ class AARCH64(Architecture):
 			taken, reason = not val&(1<<flags["carry"]) or val&(1<<flags["zero"]), "!C || Z"
 		return taken, reason
 
+	def get_disas(self, frame, process):
+
+		pc = get_register("pc", frame)
+		error = lldb.SBError()
+		buffer = process.ReadMemory(pc, 20, error)
+
+		cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+		cs.detail   = True
+		return cs.disasm(buffer, pc)
+
 	def disasm(self, address, buffer, pc):
 		cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
 		cs.detail   = True
@@ -2672,6 +2686,16 @@ class X8664(Architecture):
 			taken, reason = not val&(1<<flags["sign"]), "!S"
 		return taken, reason
 
+	def get_disas(self, frame, process):
+
+		pc = get_register("rip", frame)
+		error = lldb.SBError()
+		buffer = process.ReadMemory(pc, 20, error)
+
+		cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+		cs.detail   = True
+		return cs.disasm(buffer, pc)
+		
 	def disasm(self, address, buffer, pc):
 		cs = Cs(CS_ARCH_X86, CS_MODE_64)
 		cs.detail   = True
@@ -2720,13 +2744,9 @@ class ASLRCommand(LLDBCommand):
 	def args(self):
 		return [
 			CommandArgument(
-				arg="on",
-				help="Enable ASLR. Usage: aslr on",
+				arg="on/off",
+				help="Enable/Disable ASLR. Usage: aslr on",
 			),
-			CommandArgument(
-				arg="off",
-				help="disable ASLR. Usage: aslr off",
-			)
 		]
 
 	def description(self):
@@ -2736,7 +2756,7 @@ class ASLRCommand(LLDBCommand):
 		launchInfo = lldb.debugger.GetSelectedTarget().GetLaunchInfo()
 		flags 	= launchInfo.GetLaunchFlags()
 		
-		if arguments[0] == False:
+		if not arguments[0]:
 			if flags & lldb.eLaunchFlagDisableASLR:
 				print(f"{RED}ASLR{RST} : {GRN}off{RST}")
 			else:
@@ -2772,7 +2792,7 @@ class ChecksecCommand(LLDBCommand):
 		]	
 	
 	def run(self, arguments, option):
-		if arguments[0] == False:
+		if not arguments[0]:
 			arguments[0] = lldb.debugger.GetSelectedTarget().GetExecutable().fullpath
 		
 		mach = Mach(lldb.debugger)
@@ -2796,7 +2816,7 @@ class DisplayMachoHeaderCommand(LLDBCommand):
 		]
 	
 	def run(self, arguments, option):
-		if arguments[0] == False:
+		if not arguments[0]:
 			arguments[0] = lldb.debugger.GetSelectedTarget().GetExecutable().fullpath
 		
 		mach = Mach(lldb.debugger)
@@ -2820,7 +2840,7 @@ class DisplayMachoLoadCmdCommand(LLDBCommand):
 		]
 	
 	def run(self, arguments, option):
-		if arguments[0] == False:
+		if not arguments[0]:
 			arguments[0] = lldb.debugger.GetSelectedTarget().GetExecutable().fullpath
 		
 		mach = Mach(lldb.debugger)
@@ -2857,17 +2877,11 @@ class CapstoneDisassembleCommand(LLDBCommand):
 		address	= frame.pc
 
 		if arguments[0]:
-			if "$" == arguments[0][0]:
-				address = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
-			else:
-				address = int(arguments[0], 16)
+			address = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
 
 		length = 32
 		if arguments[1]:
-			if "0x" in arguments[1][:2]:
-				length = to_int(arguments[1])
-			else:
-				length = int(arguments[1])
+			length = evaluateInputExpression(arguments[1]).GetValueAsUnsigned()
 
 		error = lldb.SBError()
 		buffer = process.ReadMemory(address, length, error)
@@ -2899,11 +2913,10 @@ class ContextCommand(LLDBCommand):
 
 		if arguments[0] == "all":
 			for thread in process.threads:
-				if thread.GetStopReason() != lldb.eStopReasonNone and thread.GetStopReason() != lldb.eStopReasonInvalid:
-					self.print_thread_context(thread, process)
+				self.print_thread_context(thread, process)
 
 		elif arguments[0]:
-			thread_id = to_int(arguments[0])
+			thread_id = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
 			thread	  = process.GetThreadByIndexID(thread_id)
 			if thread:
 				self.print_thread_context(thread, process)
@@ -2943,15 +2956,15 @@ class RegisterReadCommand(LLDBCommand):
 	def args(self):
 		return [
 			CommandArgument(
-				arg="frame",
-				type="int",
-				help="frame id",
-			),
-			CommandArgument(
 				arg="thread",
 				type="int",
 				help="thread id",
-			)
+			),
+			CommandArgument(
+				arg="frame",
+				type="int",
+				help="frame id",
+			)			
 		]
 	
 	@process_is_alive
@@ -2959,13 +2972,10 @@ class RegisterReadCommand(LLDBCommand):
 		target 	= lldb.debugger.GetSelectedTarget()
 		process = target.process
 		
-		if arguments[0]=="all":
-			for thread in process.threads:
-					self.print_registers(thread, 0, process)
+		if arguments[0] and arguments[1]:
+			thread_id = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
+			frame_id  = evaluateInputExpression(arguments[1]).GetValueAsUnsigned()
 
-		elif arguments[0]!=False and arguments[1]!=False:
-			frame_id  = to_int(arguments[0])
-			thread_id = to_int(arguments[1])
 			thread	  = process.GetThreadByIndexID(thread_id)
 			if thread:
 				self.print_registers(thread, frame_id, process)
@@ -3000,8 +3010,7 @@ class DisplayStackCommand(LLDBCommand):
 			CommandArgument(
 				arg="size",
 				type="int",
-				help="stack size to display",
-				default=64
+				help="stack size to display"
 			),
 			CommandArgument(
 				arg="frame",
@@ -3021,23 +3030,22 @@ class DisplayStackCommand(LLDBCommand):
 		process = target.process
 		stack_size = 128
 
-		if arguments[0] != False:
-			stack_size = to_int(arguments[0])
-		
-		if arguments[0]=="all":
-			for thread in process.threads:
-					self.print_stack(stack_size, frame_id, thread, process)
+		if arguments[0]:
+			stack_size = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
 
-		elif arguments[0]!=False and arguments[1]!=False:
-			frame_id  = to_int(arguments[0])
-			thread_id = to_int(arguments[1])
+		if arguments[1] and arguments[2]:
+			stack_size = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
+			frame_id  = evaluateInputExpression(arguments[1]).GetValueAsUnsigned()
+			thread_id = evaluateInputExpression(arguments[2]).GetValueAsUnsigned()
+
 			thread	  = process.GetThreadByIndexID(thread_id)
 			if thread:
 				self.print_stack(stack_size, frame_id, thread, process)
 
 		else:
 			thread = process.GetSelectedThread()
-			self.print_stack(stack_size, 0, thread, process)
+			frame = thread.GetSelectedFrame()
+			self.print_stack(stack_size, frame.idx, thread, process)
 
 	def print_stack(self, stack_size, frame_id, thread, process):
 
@@ -3064,7 +3072,6 @@ class DumpStackCommand(LLDBCommand):
 				arg="size",
 				type="int",
 				help="stack size to display",
-				default=64
 			),
 			CommandArgument(
 				arg="frame",
@@ -3084,16 +3091,13 @@ class DumpStackCommand(LLDBCommand):
 		process = target.process
 		stack_size = 128
 
-		if arguments[0] != False:
-			stack_size = to_int(arguments[0])
+		if arguments[0]:
+			stack_size = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
 		
-		if arguments[0]=="all":
-			for thread in process.threads:
-					self.print_stack(stack_size, frame_id, thread, process)
-
-		elif arguments[0]!=False and arguments[1]!=False:
-			frame_id  = to_int(arguments[0])
-			thread_id = to_int(arguments[1])
+		if arguments[0] and arguments[1]:
+			stack_size = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
+			frame_id  = evaluateInputExpression(arguments[1]).GetValueAsUnsigned()
+			thread_id = evaluateInputExpression(arguments[2]).GetValueAsUnsigned()
 			thread	  = process.GetThreadByIndexID(thread_id)
 			if thread:
 				self.print_stack(stack_size, frame_id, thread, process)
@@ -3124,10 +3128,10 @@ class DisplayMemoryCommand(LLDBCommand):
 	def args(self):
 		return [
 			CommandArgument(
-				arg="start",
+				arg="address",
 				type="int",
 				help="start of memory to display",
-				default=64
+				default=1
 			),
 			CommandArgument(
 				arg="size",
@@ -3140,16 +3144,17 @@ class DisplayMemoryCommand(LLDBCommand):
 	def run(self, arguments, option):
 		target 	= lldb.debugger.GetSelectedTarget()
 		process = target.process
+		address = 0
+		length = 64
 
-		if arguments[0]!=False and arguments[1]!=False:
-			if "$" == arguments[0][0]:
-				address = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
-			else:
-				address  = to_int(arguments[0])
-			size 	 = to_int(arguments[1])
+		if arguments[0]:
+			address = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
+		
+		if arguments[1]:
+			length = evaluateInputExpression(arguments[1]).GetValueAsUnsigned()
 
-			if address and size:
-				self.print_memory(address, size, process)
+		if address and length:
+			self.print_memory(address, length, process)
 
 	def print_memory(self, address, size, process):
 
@@ -3170,10 +3175,10 @@ class ReadMemoryCommand(LLDBCommand):
 	def args(self):
 		return [
 			CommandArgument(
-				arg="start",
+				arg="address",
 				type="int",
 				help="start of memory to display",
-				default=64
+				default=1
 			),
 			CommandArgument(
 				arg="size",
@@ -3186,16 +3191,17 @@ class ReadMemoryCommand(LLDBCommand):
 	def run(self, arguments, option):
 		target 	= lldb.debugger.GetSelectedTarget()
 		process = target.process
+		address = 0
+		length = 64
 
-		if arguments[0]!=False and arguments[1]!=False:
-			if "$" == arguments[0][0]:
-				address = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
-			else:
-				address  = to_int(arguments[0])
-			size 	 = to_int(arguments[1])
+		if arguments[0]:
+			address = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
 
-			if address and size:
-				self.print_memory(address, size, process)
+		if arguments[1]:
+			length 	 = evaluateInputExpression(arguments[1]).GetValueAsUnsigned()
+		
+		if address and length:
+			self.print_memory(address, length, process)
 
 	def print_memory(self, address, size, process):
 
@@ -3260,6 +3266,45 @@ class PrettyBacktraceCommand(LLDBCommand):
 			else:
 				print(f"    frame #{frame.idx:02} ->  {RED}0x{frame.pc:08x}{RST} {CYN}{libname}{RST}`{GRN}{frame.name}{RST} + {symbol_offset}")
 
+class ExploitableCommand(LLDBCommand):
+	def name(self):
+		return "exploitable"
+
+	def description(self):
+		return "Check if the current exception context is exploitable"
+	
+	def args(self):
+		return [
+			CommandArgument(
+				arg="thread_id",
+				type="int",
+				help="ID of the exception thread. Uses selected thread by default",
+				default=64
+			)
+		]
+
+	@process_is_alive
+	def run(self, arguments, option):
+		target 	= lldb.debugger.GetSelectedTarget()
+		process = target.GetProcess()
+		thread 	= process.GetSelectedThread()
+
+		if arguments[0]:
+			tid 	= evaluateInputExpression(arguments[0]).GetValueAsUnsigned()e
+			thread 	= process.GetThreadByIndexID(tid)
+
+		frame = thread.GetFrameAtIndex(0)
+		target_arch 	= get_target_arch()
+
+		stop_description = thread.GetStopDescription(1024)
+		
+		# op = lldb.SBStream()
+		# if thread.GetStopReasonExtendedInfoAsJSON(op):
+		# 	# if target is compile with ASAN etc, we might get some extra info
+		# 	print(op)
+		print(stop_description)
+		# exception, code, extra = parse_stopDescription(stop_description)
+
 def __lldb_init_module(debugger, dict):
 	context_title(" lisa ")
 
@@ -3286,5 +3331,7 @@ def __lldb_init_module(debugger, dict):
 	load_command(current_module, DisplayMemoryCommand(), "lisa")
 	load_command(current_module, ReadMemoryCommand(), "lisa")
 	load_command(current_module, PrettyBacktraceCommand(), "lisa")
+	load_command(current_module, ExploitableCommand(), "lisa")
 
 	command_iterpreter.HandleCommand("target stop-hook add --one-liner 'context'", res)
+	command_iterpreter.HandleCommand("command alias ct context", res)
