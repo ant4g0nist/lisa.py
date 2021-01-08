@@ -67,6 +67,9 @@ Restricted 	 : True (Authority=Software Signing)
 (lisa:>) 
 ```
 
+## TODO
+- Add more testcases to test exploitable command
+
 ### Credits
 
 - [lldb](https://lldb.llvm.org/)

@@ -18,6 +18,8 @@ import platform
 import functools
 import subprocess
 from capstone import *
+from capstone import arm64_const
+from capstone import x86_const
 from optparse import OptionParser
 
 BLK = "\033[30m"
@@ -33,6 +35,12 @@ HORIZONTAL_LINE = "\u2500"
 VERTICAL_LINE = "\u2502"
 
 __prompt__ = f"'(lisa:>) '"
+
+# from CW
+MINIMUM_RECURSION_LENGTH = 300
+NO_CHANGE 				  = 0
+CHANGE_TO_EXPLOITABLE	  = 1
+CHANGE_TO_NOT_EXPLOITABLE = 2
 
 # cpu types
 CPU_TYPE_I386   = 7
@@ -63,6 +71,22 @@ def context_title(m):
 	title += line_color+" {:{padd}<4}".format("", padd=HORIZONTAL_LINE)+RST
 	print(title)
 
+def get_host_pagesize():
+	host_machine 	= get_host_machine()
+	target_arch		= get_target_triple().split('-')[0]
+
+	page_size = 0
+
+	if host_machine == target_arch:
+		page_size = run_shell_command('getconf PAGE_SIZE').stdout.rstrip()
+	elif host_machine=="arm64" and target_arch=="x86_64":
+		page_size = run_shell_command('arch -x86_64 getconf PAGE_SIZE').stdout.rstrip()
+	else:
+		errlog("get_host_pagesize failed")
+		return -1
+
+	return int(page_size)
+
 def get_host_machine():
 	return platform.machine()
 
@@ -91,12 +115,6 @@ def get_target_arch():
 		return X8664()
 	else:
 		errlog(f"Architecture {arch} not supported")
-
-def to_int(var, base=16):
-	try:
-		return int(var, base)
-	except:
-		return None
 
 def run_shell_command(command, shell=True):
 	return subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=shell)
@@ -268,8 +286,7 @@ def usage_for_command(command):
 
 class CommandArgument:  # noqa B903
 	def __init__(
-		self, short="", long="", arg="", type="", help="", default="", boolean=False, required=False
-	):
+		self, short="", long="", arg="", type="", help="", default="", boolean=False):
 		self.shortName = short
 		self.longName = long
 		self.argName = arg
@@ -277,7 +294,6 @@ class CommandArgument:  # noqa B903
 		self.help = help
 		self.default = default
 		self.boolean = boolean
-		self.required = required
 
 class LLDBCommand:
 	def name(self):
@@ -482,7 +498,7 @@ def evaluateInputExpression(expression, printErrors=True):
 	error = value.GetError()
 
 	if printErrors and error.Fail():
-		print(error)
+		errlog(error)
 
 	return value
 
@@ -2313,28 +2329,100 @@ def get_register(reg, frame=None):
 		thread	= process.GetSelectedThread()
 		frame	= thread.GetSelectedFrame()
 
-	if reg=="pc":
-		return frame.pc
-	
-	if reg=="sp":
-		return frame.sp
-	
-	if reg=="fp":
-		return frame.fp
-		
 	result = 0
 	registers = frame.GetRegisters()
 	for value in registers:
 		for child in value:
 			if child.GetName().lower() == reg.lower() and child.value:
-				return int(child.value,16)
+				return child.GetValueAsUnsigned()
 
 			if not child.value and child.GetName().lower() == reg.lower():
 				return 0xffff_ffff_ffff_ffff
 
 def parse_stopDescription(description):
-	pass
+	'''
+	Returns up to three values. Exception Type as a string
+	'EXC_BAD_ACCESS', Exception Code as a string (can be like '1'
+	or like 'EXC_I386_GPFLT') and Extra as a string (can be an address
+	'0x00000000' or a subcode '0x0')
+	'''
+
+	# EXC_BAD_ACCESS (code=2, address=0x100804000)
+	# EXC_BAD_ACCESS (code=EXC_I386_GPFLT)
+	# EXC_BAD_INSTRUCTION (code=EXC_I386_INVOP, subcode=0x0)
+
+	table = str.maketrans(dict.fromkeys('(),'))
+	desc = description.translate(table)
+
+	if not (desc.startswith("EXC_") or desc.startswith("code=")):
+		print("WARNING: Malformed exception description output %s" % desc)
+		return None, None, None
+
+	fields = desc.split()
+	exc = fields[0]
+	code = fields[1].split("=", 2)[1]
+	extra = None
+	for f in fields:
+		if f.startswith("address=") or f.startswith("subcode="):
+			extra = f.split("=", 2)[1]
+			break
+
+	return [exc, code, extra]
+
+def check_if_recursion(thread):
+	idx = 0
+	while idx < MINIMUM_RECURSION_LENGTH:
+		if not thread.GetFrameAtIndex(idx).IsValid():
+			return False
+		idx += 1
+	return True
+
+#determine if a log is exploitable by processing the stack trace, (not by disassembly)
+def is_stack_suspicious(thread, exception, code, extra):
+	# returns NO_CHANGE, CHANGE_TO_EXPLOITABLE, or CHANGE_TO_NOT_EXPLOITABLE
 	
+	if exception == "EXC_BREAKPOINT":
+		return NO_CHANGE
+
+	# //If any of these functions are in the stack trace, it's likely that the crash is exploitable.
+	# //It uses a substring match, so we put spaces around the names to prevent false positives.
+	# //the CSMem ones are used a lot by QuickTime.
+	# //objc_msgSend has no space at the end because there are other similar named functions 
+	# //like objc_msgSend_vtable14
+	suspicious_functions = ["__stack_chk_fail","szone_error","CFRelease","CFRetain","_CFRelease","_CFRetain", 
+		"malloc","calloc","realloc", "objc_msgSend",
+		"szone_free","free_small","tiny_free_list_add_ptr","tiny_free_list_remove_ptr",
+		"small_free_list_add_ptr","small_free_list_remove_ptr","large_entries_free_no_lock", 
+		"large_free_no_lock","szone_batch_free","szone_destroy","free", 
+		"CSMemDisposeHandle", "CSMemDisposePtr",
+		"_CFStringAppendFormatAndArgumentsAux","WTF::fastFree","WTF::fastMalloc",
+		"WTF::FastCalloc","WTF::FastRealloc"," WTF::tryFastCalloc","WTF::tryFastMalloc",  
+		"WTF::tryFastRealloc","WTF::TCMalloc_Central_FreeList","GMfree","GMmalloc_zone_free",
+		"GMrealloc","GMmalloc_zone_realloc","WTFCrashWithSecurityImplication","__chk_fail_overflow"]
+
+	non_exploitable_functions = ["ABORTING_DUE_TO_OUT_OF_MEMORY"]
+
+	funcs = [ ]
+	for i in range(0, thread.GetNumFrames()):
+		frame = thread.GetFrameAtIndex(i)
+		funcname = frame.GetFunctionName()
+		for susp in suspicious_functions:
+			if exception == "EXC_BREAKPOINT" and funcname in ("CFRelease", "CFRetain"):
+				return CHANGE_TO_NOT_EXPLOITABLE
+
+			if susp == funcname:
+				funcs.append(susp)
+
+	if funcs:
+		return " ".join(funcs)
+
+	return False
+		
+def is_near_null(address):
+	if address < 16 * get_host_pagesize():
+		return True
+	
+	return False
 
 def flags_to_human(reg_value, value_table):
 	"""Return a human readable string showing the flag states."""
@@ -2455,6 +2543,32 @@ class AARCH64(Architecture):
 	syscall_register 	 = "x8"
 	syscall_instructions = "svc"
 	function_parameters  = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+	exceptions	=	{
+						"EXC_BAD_ACCESS": {
+								0x101	:	{"title": "EXC_ARM_DA_ALIGN", "desc" : "Alignment Fault"},
+								0x102	:	{"title":"EXC_ARM_DA_DEBUG", "desc"  : "Debug (watch/break) Fault"},
+								0x103	:	{"title":"EXC_ARM_SP_ALIGN", "desc" : "SP Alignment Fault"},
+								0x104	:	{"title":"EXC_ARM_SWP", "desc" : "SWP instruction"},
+								0x105	:	{"title":"EXC_ARM_PAC_FAIL", "desc":"PAC authentication failure"},
+								0x1 	:	{"title" : "KERN_INVALID_ADDRESS", "desc": "Specified address is not currently valid."},
+								0x2		:	{"title":"KERN_PROTECTION_FAILURE", "desc":"Specified memory is valid, but does not permit the required forms of access"}
+						},
+						"EXC_ARITHMETIC" : {
+							0x0: {'title': 'EXC_ARM_FP_UNDEFINED', 'desc': 'Undefined Floating Point Exception'}, 
+							0x1: {'title': 'EXC_ARM_FP_IO', 'desc': 'Invalid Floating Point Operation'}, 
+							0x2: {'title': 'EXC_ARM_FP_DZ', 'desc': 'Floating Point Divide by Zero'}, 
+							0x3: {'title': 'EXC_ARM_FP_OF', 'desc': 'Floating Point Overflow'}, 
+							0x4: {'title': 'EXC_ARM_FP_UF', 'desc': 'Floating Point Underflow'}, 
+							0x5: {'title': 'EXC_ARM_FP_IX', 'desc': 'Inexact Floating Point Result'}, 
+							0x6: {'title': 'EXC_ARM_FP_ID', 'desc': 'Floating Point Denormal Input'}
+						},
+						"EXC_BAD_INSTRUCTION" : {
+							0x1 : { 'title': 'EXC_ARM_UNDEFINED', 'desc':"Undefined"}
+						},
+						"EXC_BREAKPOINT" : {
+							0x1 : { 'title': 'EXC_ARM_BREAKPOINT', 'desc' : "breakpoint trap"}
+						}
+					}
 
 	def is_call(self, insn):
 		mnemo = insn.mnemonic
@@ -2547,11 +2661,54 @@ class AARCH64(Architecture):
 			taken, reason = not val&(1<<flags["carry"]) or val&(1<<flags["zero"]), "!C || Z"
 		return taken, reason
 
-	def get_disas(self, frame, process):
+	def access_type(self, insn):
+		if insn.mnemonic[:2].lower()=="st":
+			return "write"
 
-		pc = get_register("pc", frame)
-		error = lldb.SBError()
-		buffer = process.ReadMemory(pc, 20, error)
+		if insn.mnemonic[:2].lower()=="ld":
+			return "read"
+		
+		return "unknown"
+
+	def get_previous_pc(self, pc, frame, process):
+		return pc-4
+
+	def get_register(self, reg, frame=None):
+		if not frame:
+			target 	= lldb.debugger.GetSelectedTarget()
+			process = target.process
+			thread	= process.GetSelectedThread()
+			frame	= thread.GetSelectedFrame()
+
+		if reg=="pc":
+			return frame.pc
+		
+		if reg=="sp":
+			return frame.sp
+		
+		if reg=="fp" or reg=="x29":
+			return frame.fp
+		
+		if reg == "lr"  or reg=="x30":
+			return get_register("lr")
+			
+		return get_register(reg)
+			
+	def get_registers(self, required=[]):
+		gpr = {}
+		
+		for reg in self.all_registers:
+			if required == [] or reg in required:
+				gpr[reg.name] = get_register(reg)
+
+		return gpr
+
+	def get_disas(self, frame, process, pc=None):
+		if not pc:
+			pc 		= get_register("pc", frame)
+
+		error 	= lldb.SBError()
+		buffer 	= process.ReadMemory(pc, 20, error)
 
 		cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
 		cs.detail   = True
@@ -2561,7 +2718,14 @@ class AARCH64(Architecture):
 		cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
 		cs.detail   = True
 		
-		for i in cs.disasm(buffer, address):
+		instuctions = cs.disasm(buffer, address)
+		try:
+			instuctions = list(instuctions)
+		except:
+			errlog(f"Failed to disassemble at {address:x}")
+			return
+
+		for i in instuctions:
 			if i.address == pc:
 				msg = ""
 				if self.is_conditional_branch(i):
@@ -2616,6 +2780,44 @@ class X8664(Architecture):
 	all_registers = gpr_registers + [ flag_register] + special_registers
 
 	function_parameters = ["$rdi", "$rsi", "$rdx", "$rcx", "$r8", "$r9"]
+
+	exceptions = {
+			"EXC_ARITHMETIC" :
+			{
+					"EXC_I386_DIVERR"  		: { "desc": "divide by 0 eprror", "code": 0x0},
+					"EXC_I386_DIV"			: { "desc": "integer divide by zero", "code": 0x1 },
+					"EXC_I386_INTO"			: { "desc": "integer overflow", "code": 0x2},
+					"EXC_I386_EXTERR"		: { "desc": "FPU error", "code" : 0x5},
+					"EXC_I386_SSEEXTERR"	: { "desc": "SSE arithmetic exception", "code" :0x8}
+			},
+
+			"EXC_BAD_ACCESS":
+				{
+					0x1 	:	{"title" : "KERN_INVALID_ADDRESS", "desc": "Specified address is not currently valid."},
+					0x2   	:	{"title":"KERN_PROTECTION_FAILURE", "desc":"Specified memory is valid, but does not permit the required forms of access"},				
+					0xd		: 	{ "desc": "general protection fault", "title": "EXC_I386_GPFLT" },
+				},
+			"EXC_BREAKPOINT":
+				{
+					0x3		: { "desc": "breakpoint fault", "title": "EXC_I386_BPTFLT" },
+					0x4		: { "desc": "INTO overflow fault", "title": "EXC_I386_INTOFLT" },
+					0x5		: { "desc": "BOUND instruction fault", "title": "EXC_I386_BOUNDFLT" },
+
+					0x6		: { "desc": "invalid opcode fault", "title": "EXC_I386_INVOPFLT" },
+					0x7		: { "desc": "extension not available fault", "title": "EXC_I386_NOEXTFLT" },
+					0x8		: { "desc": "double fault", "title": "EXC_I386_DBLFLT" },
+					0x9		: { "desc": "extension overrun fault", "title": "EXC_I386_EXTOVRFLT" },
+					0xa		: { "desc": "invalid TSS fault", "title": "EXC_I386_INVTSSFLT" },
+					0xb		: { "desc": "segment not present fault", "title": "EXC_I386_SEGNPFLT" },
+					0xc		: { "desc": "stack fault", "title": "EXC_I386_STKFLT" },
+					
+					0xe		: { "desc": "page fault", "title": "EXC_I386_PGFLT" },
+					0x10 	: { "desc": "extension error fault", "title": "EXC_I386_EXTERRFLT"},
+					0x11 	: { "desc": "Alignment fault", "title": "EXC_I386_ALIGNFLT" },
+					0x20	: { "desc": "emulated ext not present", "title": "EXC_I386_ENOEXTFLT"},
+					0x21	: { "desc": "emulated extension error flt", "title": "EXC_I386_ENDPERR"},
+				}
+	}
 
 	def flag_register_to_human(self, val=None):
 		reg = self.flag_register
@@ -2686,13 +2888,47 @@ class X8664(Architecture):
 			taken, reason = not val&(1<<flags["sign"]), "!S"
 		return taken, reason
 
-	def get_disas(self, frame, process):
+	def get_register(self, reg):
+		return get_register(reg)
 
+	def get_registers(self, want=[]):
+		'''
+		Returns the general purpose registers and returns them as a
+		map[string]uint64 or whatever you call that in python
+		'''
+
+		got = {}
+		for reg in self.all_registers:
+			if want == [] or reg in want:
+				got[reg.name] = get_register(reg)
+
+		return got
+
+	def get_previous_pc(self, pc, frame, process):
+		disassembly = frame.Disassemble().splitlines()
+		
+		for i in range(len(disassembly)):
+			instruction = disassembly[i]
+			if instruction.find(f"{pc:08x}")!=-1 and i!=0:
+				instruction = disassembly[i-1]
+				address = re.search("0x(.*)?<", instruction).group(1)
+				address = int(address, 16)
+				return address
+			
+		return 0
+
+	def access_type(self, insn):
+		operands = insn.operands
+		mnemonic = insn.mnemonic
+
+		pass
+
+	def get_disas(self, frame, process):
 		pc = get_register("rip", frame)
 		error = lldb.SBError()
 		buffer = process.ReadMemory(pc, 20, error)
-
-		cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+		
+		cs = Cs(CS_ARCH_X86, CS_MODE_64)
 		cs.detail   = True
 		return cs.disasm(buffer, pc)
 		
@@ -2700,7 +2936,14 @@ class X8664(Architecture):
 		cs = Cs(CS_ARCH_X86, CS_MODE_64)
 		cs.detail   = True
 
-		for i in cs.disasm(buffer, address):
+		instuctions = cs.disasm(buffer, address)
+		try:
+			instuctions = list(instuctions)
+		except:
+			errlog(f"Failed to disassemble at {address:x}")
+			return
+
+		for i in instuctions:
 			if i.address == pc:
 				msg = ""
 				if self.is_conditional_branch(i):
@@ -2797,7 +3040,8 @@ class ChecksecCommand(LLDBCommand):
 		
 		mach = Mach(lldb.debugger)
 		mach.parse(arguments[0])
-		mach.content.checksec()
+		if mach.content:
+			mach.content.checksec()
 
 class DisplayMachoHeaderCommand(LLDBCommand):
 	def name(self):
@@ -2821,7 +3065,8 @@ class DisplayMachoHeaderCommand(LLDBCommand):
 		
 		mach = Mach(lldb.debugger)
 		mach.parse(arguments[0])
-		mach.content.dump_header()
+		if mach.content:
+			mach.content.dump_header()
 
 class DisplayMachoLoadCmdCommand(LLDBCommand):
 	def name(self):
@@ -2845,7 +3090,8 @@ class DisplayMachoLoadCmdCommand(LLDBCommand):
 		
 		mach = Mach(lldb.debugger)
 		mach.parse(arguments[0])
-		mach.content.dump_load_commands()
+		if mach.content:
+			mach.content.dump_load_commands()
 
 class CapstoneDisassembleCommand(LLDBCommand):
 	def name(self):
@@ -3279,31 +3525,220 @@ class ExploitableCommand(LLDBCommand):
 				arg="thread_id",
 				type="int",
 				help="ID of the exception thread. Uses selected thread by default",
-				default=64
 			)
 		]
 
 	@process_is_alive
 	def run(self, arguments, option):
+		# ========= Exploitability algorithm =========
+
+		# The algorithm for determining exploitability looks like this:
+
+		# Exploitable if
+		# 	Crash on write instruction
+		# 	Crash executing invalid address
+		# 	Crash calling an invalid address
+		# 	Illegal instruction exception
+		# 	Abort due to -fstack-protector, _FORTIFY_SOURCE, heap corruption detected
+		# 	Stack trace of crashing thread contains certain functions such as malloc, free, szone_error, objc_MsgSend, etc.
+
+		# Not exploitable if
+		# 	Divide by zero exception
+		# 	Stack grows too large due to recursion
+		# 	Null dereference(read or write)
+		# 	Other abort
+		# 	Crash on read instruction
+		
 		target 	= lldb.debugger.GetSelectedTarget()
 		process = target.GetProcess()
 		thread 	= process.GetSelectedThread()
 
+		crash_code			= None
+		crash_desc			= None
+		av_is_exploitable 	= None
+		av_access_type		= None
+		access_address		= 0
+		exploit_reason		= None
+		stack_suspicious	= False
+		av_on_branch		= False
+		av_null_deref		= False
+		av_badbeef			= False
+		is_recursion		= check_if_recursion(thread)
+		disassembly			= None
+		av_exception		= None
+
 		if arguments[0]:
-			tid 	= evaluateInputExpression(arguments[0]).GetValueAsUnsigned()e
+			tid 	= evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
 			thread 	= process.GetThreadByIndexID(tid)
 
-		frame = thread.GetFrameAtIndex(0)
-		target_arch 	= get_target_arch()
+		frame 	= thread.GetFrameAtIndex(0)
+		arch 	= get_target_arch()
 
-		stop_description = thread.GetStopDescription(1024)
+		if thread.GetStopReason() == lldb.eStopReasonException:
+			page_size = get_host_pagesize()
+			av_exception = thread.GetStopDescription(1024)
+			exc, code, extra = parse_stopDescription(av_exception)
+
+			stack_suspicious = is_stack_suspicious(thread, exc, code, extra)
+
+			if is_recursion:
+				code = int(code)
+				exception 	= arch.exceptions[exc]
+				crash_code 	= exception[code]['title']
+				crash_desc	= exception[code]['desc']
+				av_access_type	  	= "recursion"
+				av_is_exploitable 	= False
+				exploit_reason 		= f"The crash is suspected to be due to unbounded recursion since there were more than {MINIMUM_RECURSION_LENGTH} stack frames"
+
+				instructions = arch.get_disas(frame, process)
+				insn = list(instructions)[0]
+
+				disassembly_operands	=	""
+				for i in insn.operands:
+					reg 	= insn.reg_name(i.reg)
+					val 	= arch.get_register(reg)
+					disassembly_operands += f"{reg}={val:x}; "
+
+				disassembly	=	f"{insn.mnemonic}\t{insn.op_str} => {disassembly_operands}"
+
+			elif stack_suspicious:
+				# exploit_reason = ""
+				# av_is_exploitable	= True
+				# if 
+				pass
+
+			elif not is_recursion and exc == "EXC_BAD_ACCESS":
+				if code and extra:
+					code = int(code)
+					exception 	= arch.exceptions[exc]
+					crash_code 	= exception[code]['title']
+					crash_desc	= exception[code]['desc']
+
+					access_address = int(extra, 16)
+
+					if access_address == "0xbbadbeef":
+						# WebCore functions call CRASH() in various assertions or if the amount to allocate was too big. CRASH writes a null byte to 0xbbadbeef.
+						av_badbeef			= True
+						av_is_exploitable	= False
+						exploit_reason 		= "Not exploitable. Seems to be a safe crash. Calls to CRASH() function writes a null byte to 0xbbadbeef"
+
+					elif is_near_null(access_address) and frame.pc == access_address:
+						av_null_deref		= True
+						av_is_exploitable	= False
+						av_access_type 		= "exec"
+						exploit_reason		= "Null Dereference. Probably not exploitable"
+
+					elif frame.pc == access_address:
+						av_is_exploitable	= True
+						av_access_type 		= "exec"
+						exploit_reason 		= "Trying to execute a bad address, this is a potentially exploitable issue"
+
+					#it's either a read or a write
+					else:
+						max_offset	 = 1024
+
+						instructions = arch.get_disas(frame, process)
+						insn = list(instructions)[0]
+						av_access_type = arch.access_type(insn)
+						
+						disassembly_operands	=	""
+						for i in insn.operands:
+							reg 	= insn.reg_name(i.reg)
+							val 	= arch.get_register(reg)
+							disassembly_operands += f"{reg}={val:x}; "
+
+						disassembly	=	f"{insn.mnemonic}\t{insn.op_str} => {disassembly_operands}"
+
+						if is_near_null(access_address):
+							av_is_exploitable 	= False
+							av_null_deref		= True
+							exploit_reason		= "Null Dereference. Probably not exploitable"
+
+						# cw: assumes reads are not exploitable
+						elif av_access_type == "read" and access_address > 0x55555555 - max_offset and access_address < 0x55555555 + max_offset:
+							# It's probably exploitable in the MallocScribble case, but not necessarily in the libgmalloc case.
+							# Don't mark it exploitable, since libgmalloc is used much more than MallocScribble these days. 
+							av_is_exploitable 	= False
+							exploit_reason		= "The access address indicates the use of freed memory if MallocScribble was used, or uninitialized memory if libgmalloc and MALLOC_FILL_SPACE was used."
+						
+						elif av_access_type == "read" and access_address > 0xaaaaaaaa - max_offset and access_address < 0xaaaaaaaa + max_offset:
+							# reading an uninitialized pointer isn't necessarily exploitable but it's interesting to note.
+							av_is_exploitable	= False
+							exploit_reason		= "The access address indicates that uninitialized memory was being used if MallocScribble was used."
+						
+						# cw: writes assumed as exploitable
+						elif av_access_type == "write":
+							# Crash on write instruction
+							av_is_exploitable = True
+							exploit_reason		= f"Crash writing to invalid address {RED}{access_address:x}{RST}"
+
+					if av_access_type == "exec":
+						# let's see who called this?
+						if thread.GetNumFrames() >= 2:
+							frame1 = thread.GetFrameAtIndex(frame.idx+1)
+							pc 	   = frame1.pc
+							previous_pc = arch.get_previous_pc(pc, frame1, pc)
+
+							instructions = arch.get_disas(frame1, process, previous_pc)
+							insn = list(instructions)[0]
+							for g in insn.groups:
+								if g == arm64_const.ARM64_GRP_BRANCH_RELATIVE or g == arm64_const.ARM64_GRP_CALL or g == arm64_const.ARM64_GRP_JUMP:
+									av_on_branch = True
+								elif g == x86_const.X86_GRP_JUMP or g == x86_const.X86_GRP_BRANCH_RELATIVE:
+									av_on_branch = True
+
+							disassembly_operands	=	""
+							for i in insn.operands:
+								reg 	= insn.reg_name(i.reg)
+								val 	= arch.get_register(reg)
+								disassembly_operands += f"{reg}={val:x}; "
+
+							disassembly	=	f"{insn.mnemonic}\t{insn.op_str} => {disassembly_operands}"
+
+				elif code == "EXC_I386_GPFLT":
+					# //When the address would be invalid in the 64-bit ABI, we get a EXC_I386_GPFLT and 
+					# //the access address shows up as 0.  That shouldn't count as a null deref.
+					# //(0x0000800000000000 to 0xFFFF800000000000 is not addressable, 
+					# //0xFFFF800000000000 and up is reserved for future kernel use)
+					exploit_reason = "The exception code indicates that the access address was invalid in the 64-bit ABI (it was > 0x0000800000000000)."
+
+				else:
+					print(f"crash code  : {exception[code]['title']}")
+					errlog("Not implemented")
+					return
+
+			elif exc == "EXC_BAD_INSTRUCTION":
+				# (lisa:>) disassemble 
+				# libsystem_c.dylib`__chk_fail_overflow:
+				#     0x7fff2036a0fd <+0>:  pushq  %rbp
+				#     0x7fff2036a0fe <+1>:  movq   %rsp, %rbp
+				#     0x7fff2036a101 <+4>:  leaq   0x9c35(%rip), %rdi        ; "detected buffer overflow"
+				#     0x7fff2036a108 <+11>: callq  0x7fff2036abc3            ; _os_crash
+				# ->  0x7fff2036a10d <+16>: ud2    
+				pass
+
+			elif exc == "EXC_ARITHMETIC":
+				exception 	= arch.exceptions[exc]
+				crash_code	=	code
+				crash_desc	=	exception[code]['desc']
+
+		elif thread.GetStopReason() == lldb.eStopReasonSignal:
+			pass
 		
-		# op = lldb.SBStream()
-		# if thread.GetStopReasonExtendedInfoAsJSON(op):
-		# 	# if target is compile with ASAN etc, we might get some extra info
-		# 	print(op)
-		print(stop_description)
-		# exception, code, extra = parse_stopDescription(stop_description)
+		print(f"crash_code		: {GRN}{crash_code}{RST}")
+		print(f"crash_desc		: {crash_desc}")
+		print(f"av_on_branch		: {YEL}{av_on_branch}{RST}")
+		print(f"av_null_deref		: {YEL}{av_null_deref}{RST}")
+		print(f"av_badbeef		: {YEL}{av_badbeef}{RST}")
+		print(f"is_recursion		: {YEL}{is_recursion}{RST}")
+		print(f"av_type			: {MAG}{av_access_type}{RST}")
+		print(f"av_address		: {access_address:x}")
+		print(f"stack_suspicious	: {stack_suspicious}")
+		av_is_exploitable	=	f"{RED}True{RST}" if av_is_exploitable else f"{YEL}False{RST}"
+		print(f"av_is_exploitable 	: {av_is_exploitable}")
+		print(f"exploit_reason		: {exploit_reason}")
+		print(f"disassembly		: {disassembly}")
+
 
 def __lldb_init_module(debugger, dict):
 	context_title(" lisa ")
