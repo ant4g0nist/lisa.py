@@ -31,6 +31,8 @@ MAG = "\033[35m"
 CYN = "\033[36m"
 WHT = "\033[37m"
 RST = "\033[0m"
+BASE00 = '#657b83'
+Punctuation = BASE00
 HORIZONTAL_LINE = "\u2500"
 VERTICAL_LINE = "\u2502"
 
@@ -386,7 +388,7 @@ def visual_hexdump(buffer, start=0, end=None, columns=64):
 
 HEADER = '┌────────────────┬─────────────────────────┬─────────────────────────┬────────┬────────┐'
 FOOTER = RST+'└────────────────┴─────────────────────────┴─────────────────────────┴────────┴────────┘'
-LINE_FORMATTER = '│' + '' + '{:016x}' + '│ {}' + '│{}'  + '│'
+LINE_FORMATTER = '│' + '' + '{:016x}' + '│ {}' + '│{}'  + '│' + RST
 
 def hexmod(b: int) -> str:
 	'''10 -> "0xa" -> "0a"'''
@@ -2337,7 +2339,89 @@ def get_register(reg, frame=None):
 				return child.GetValueAsUnsigned()
 
 			if not child.value and child.GetName().lower() == reg.lower():
+				errlog(f"Failed to get register : {child.GetName()}")
 				return 0xffff_ffff_ffff_ffff
+
+def dereference(pointer):
+	"""
+	Recursively dereference a pointer for display
+	"""
+	MAX_DEREF = 8
+	t = lldb.debugger.GetSelectedTarget()
+	error = lldb.SBError()
+
+	addr = pointer
+	chain = []
+
+	# recursively dereference
+	for i in range(0, MAX_DEREF):
+		ptr = t.process.ReadPointerFromMemory(addr, error)
+		if error.Success():
+			if ptr in chain:
+				chain.append(('circular', 'circular'))
+				break
+			chain.append(('pointer', addr))
+			addr = ptr
+		else:
+			break
+
+	if len(chain) == 0:
+		# errlog(f"0x{pointer:x} is not a valid pointer")
+		return
+
+	# get some info for the last pointer
+	# first try to resolve a symbol context for the address
+	p, addr = chain[-1]
+	sbaddr = lldb.SBAddress(addr, t)
+	ctx = t.ResolveSymbolContextForAddress(sbaddr, lldb.eSymbolContextEverything)
+	if ctx.IsValid() and ctx.GetSymbol().IsValid():
+		# found a symbol, store some info and we're done for this pointer
+		fstart = ctx.GetSymbol().GetStartAddress().GetLoadAddress(t)
+		offset = addr - fstart
+		chain.append(('symbol', '{} + 0x{:X}'.format(ctx.GetSymbol().name, offset)))
+		# log.debug("symbol context: {}".format(str(chain[-1])))
+	else:
+		# no symbol context found, see if it looks like a string
+		# errlog("no symbol context")
+		try:
+			s = t.process.ReadCStringFromMemory(addr, 256, error)
+			for i in range(0, len(s)):
+				if ord(s[i]) >= 128:
+					s = s[:i]
+					break
+			if len(s):
+				chain.append(('string', s))
+		
+		except:
+			pass
+
+	return chain
+
+def format_address(address, size=8, pad=True, prefix='0x'):
+	fmt = '{:' + ('0=' + str(size * 2) if pad else '') + 'X}'
+	addr_str = fmt.format(address)
+	if prefix:
+		addr_str = prefix + addr_str
+	return addr_str
+
+def get_deref_chain_as_string(chain):
+	for i, (t, item) in enumerate(chain):
+		if t == "pointer":
+			yield (MAG, format_address(item, size=16, pad=False))
+		elif t == "string":
+			for r in ['\n', '\r', '\v']:
+				item = item.replace(r, '\\{:x}'.format(ord(r)))
+			yield (RED, '"' + item + '"')
+		elif t == "unicode":
+			for r in ['\n', '\r', '\v']:
+				item = item.replace(r, '\\{:x}'.format(ord(r)))
+			yield (RED, 'u"' + item + '"')
+		elif t == "symbol":
+			yield (BLU, '`' + item + '`')
+		elif t == "circular":
+			yield (GRN, '(circular)')
+		if i < len(chain) - 1:
+			yield (CYN, ' => ')
 
 def parse_stopDescription(description):
 	'''
@@ -2380,9 +2464,6 @@ def check_if_recursion(thread):
 #determine if a log is exploitable by processing the stack trace, (not by disassembly)
 def is_stack_suspicious(thread, exception, code, extra):
 	# returns NO_CHANGE, CHANGE_TO_EXPLOITABLE, or CHANGE_TO_NOT_EXPLOITABLE
-	
-	if exception == "EXC_BREAKPOINT":
-		return NO_CHANGE
 
 	# //If any of these functions are in the stack trace, it's likely that the crash is exploitable.
 	# //It uses a substring match, so we put spaces around the names to prevent false positives.
@@ -2415,6 +2496,9 @@ def is_stack_suspicious(thread, exception, code, extra):
 
 	if funcs:
 		return " ".join(funcs)
+	
+	if exception == "EXC_BREAKPOINT":
+		return NO_CHANGE
 
 	return False
 		
@@ -2543,32 +2627,51 @@ class AARCH64(Architecture):
 	syscall_register 	 = "x8"
 	syscall_instructions = "svc"
 	function_parameters  = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
-	exceptions	=	{
-						"EXC_BAD_ACCESS": {
-								0x101	:	{"title": "EXC_ARM_DA_ALIGN", "desc" : "Alignment Fault"},
-								0x102	:	{"title":"EXC_ARM_DA_DEBUG", "desc"  : "Debug (watch/break) Fault"},
-								0x103	:	{"title":"EXC_ARM_SP_ALIGN", "desc" : "SP Alignment Fault"},
-								0x104	:	{"title":"EXC_ARM_SWP", "desc" : "SWP instruction"},
-								0x105	:	{"title":"EXC_ARM_PAC_FAIL", "desc":"PAC authentication failure"},
-								0x1 	:	{"title" : "KERN_INVALID_ADDRESS", "desc": "Specified address is not currently valid."},
-								0x2		:	{"title":"KERN_PROTECTION_FAILURE", "desc":"Specified memory is valid, but does not permit the required forms of access"}
-						},
-						"EXC_ARITHMETIC" : {
-							0x0: {'title': 'EXC_ARM_FP_UNDEFINED', 'desc': 'Undefined Floating Point Exception'}, 
-							0x1: {'title': 'EXC_ARM_FP_IO', 'desc': 'Invalid Floating Point Operation'}, 
-							0x2: {'title': 'EXC_ARM_FP_DZ', 'desc': 'Floating Point Divide by Zero'}, 
-							0x3: {'title': 'EXC_ARM_FP_OF', 'desc': 'Floating Point Overflow'}, 
-							0x4: {'title': 'EXC_ARM_FP_UF', 'desc': 'Floating Point Underflow'}, 
-							0x5: {'title': 'EXC_ARM_FP_IX', 'desc': 'Inexact Floating Point Result'}, 
-							0x6: {'title': 'EXC_ARM_FP_ID', 'desc': 'Floating Point Denormal Input'}
-						},
-						"EXC_BAD_INSTRUCTION" : {
-							0x1 : { 'title': 'EXC_ARM_UNDEFINED', 'desc':"Undefined"}
-						},
-						"EXC_BREAKPOINT" : {
-							0x1 : { 'title': 'EXC_ARM_BREAKPOINT', 'desc' : "breakpoint trap"}
-						}
+	exceptions	= {
+					"EXC_BAD_ACCESS" :
+					{
+							0x101	:	{"title": "EXC_ARM_DA_ALIGN", "desc" : "Alignment Fault"},
+							0x102	:	{"title":"EXC_ARM_DA_DEBUG", "desc"  : "Debug (watch/break) Fault"},
+							0x103	:	{"title":"EXC_ARM_SP_ALIGN", "desc" : "SP Alignment Fault"},
+							0x104	:	{"title":"EXC_ARM_SWP", "desc" : "SWP instruction"},
+							0x105	:	{"title":"EXC_ARM_PAC_FAIL", "desc":"PAC authentication failure"},
+							0x1 	:	{"title" : "KERN_INVALID_ADDRESS", "desc": "Specified address is not currently valid."},
+							0x2		:	{"title":"KERN_PROTECTION_FAILURE", "desc":"Specified memory is valid, but does not permit the required forms of access"}
+					},
+					"EXC_ARITHMETIC" :
+					{
+						0x0: {'title': 'EXC_ARM_FP_UNDEFINED', 'desc': 'Undefined Floating Point Exception'}, 
+						0x1: {'title': 'EXC_ARM_FP_IO', 'desc': 'Invalid Floating Point Operation'}, 
+						0x2: {'title': 'EXC_ARM_FP_DZ', 'desc': 'Floating Point Divide by Zero'}, 
+						0x3: {'title': 'EXC_ARM_FP_OF', 'desc': 'Floating Point Overflow'}, 
+						0x4: {'title': 'EXC_ARM_FP_UF', 'desc': 'Floating Point Underflow'}, 
+						0x5: {'title': 'EXC_ARM_FP_IX', 'desc': 'Inexact Floating Point Result'}, 
+						0x6: {'title': 'EXC_ARM_FP_ID', 'desc': 'Floating Point Denormal Input'}
+					},
+					"EXC_BAD_INSTRUCTION" :
+					{
+						'EXC_ARM_UNDEFINED' : { 'code': 0x1, 'desc':"Undefined"}
+					},
+					"EXC_BREAKPOINT" :
+					{
+						0x1 : { 'title': 'EXC_ARM_BREAKPOINT', 'desc' : "breakpoint trap"}
 					}
+				}
+
+	def get_code_desc(self, exc, code):
+		crash_code, crash_desc = None, None
+
+		if exc in ['EXC_BAD_INSTRUCTION']:
+			exception	= self.exceptions[exc]
+			crash_code 	= exc
+			crash_desc	= exception[code]['desc']
+
+		elif exc in self.exceptions:
+			exception 	= self.exceptions[exc]
+			crash_code 	= exception[code]['title']
+			crash_desc	= exception[code]['desc']
+		
+		return crash_code, crash_desc
 
 	def is_call(self, insn):
 		mnemo = insn.mnemonic
@@ -2661,7 +2764,7 @@ class AARCH64(Architecture):
 			taken, reason = not val&(1<<flags["carry"]) or val&(1<<flags["zero"]), "!C || Z"
 		return taken, reason
 
-	def access_type(self, insn):
+	def get_access_type(self, insn):
 		if insn.mnemonic[:2].lower()=="st":
 			return "write"
 
@@ -2712,7 +2815,44 @@ class AARCH64(Architecture):
 
 		cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
 		cs.detail   = True
+		
 		return cs.disasm(buffer, pc)
+
+	def get_disas_to_print(self, frame, process, pc=None):
+		if not pc:
+			pc 		= get_register("pc", frame)
+
+		instructions = list(self.get_disas(frame, process, pc))
+
+		if instructions == []:
+			return "", False, None
+
+		insn = instructions[0]
+		av_access_type = self.get_access_type(insn)
+		av_on_branch = False
+		
+		for g in insn.groups:
+			if g == arm64_const.ARM64_GRP_BRANCH_RELATIVE or g == arm64_const.ARM64_GRP_CALL or g == arm64_const.ARM64_GRP_JUMP:
+				av_on_branch = True
+
+		disassembly_operands	=	""
+		for i in insn.operands:
+			if i.type== arm64_const.ARM64_OP_REG:
+				reg 	= insn.reg_name(i.reg)
+				val 	= self.get_register(reg)
+				disassembly_operands += f"{reg}={val:x}; "
+			elif i.type == arm64_const.ARM64_OP_MEM:
+				if i.reg:
+					reg 	= insn.reg_name(i.reg)
+					val 	= self.get_register(reg)
+					disassembly_operands += f"{reg}={val:x}; "
+
+		if disassembly_operands:
+			disassembly	=	f"{insn.mnemonic}\t{insn.op_str} => {disassembly_operands}"
+		else:
+			disassembly	=	f"{insn.mnemonic}\t{insn.op_str}"
+
+		return disassembly, av_on_branch, av_access_type
 
 	def disasm(self, address, buffer, pc):
 		cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
@@ -2816,9 +2956,28 @@ class X8664(Architecture):
 					0x11 	: { "desc": "Alignment fault", "title": "EXC_I386_ALIGNFLT" },
 					0x20	: { "desc": "emulated ext not present", "title": "EXC_I386_ENOEXTFLT"},
 					0x21	: { "desc": "emulated extension error flt", "title": "EXC_I386_ENDPERR"},
-				}
+				},
+			"EXC_BAD_INSTRUCTION" :
+			{
+				"EXC_I386_INVOP" : {"desc": "Undefined", "code": 0x1}
+			}
 	}
 
+	def get_code_desc(self, exc, code):
+		crash_code, crash_desc = None, None
+
+		if exc in ['EXC_BAD_INSTRUCTION', 'EXC_ARITHMETIC']:
+			exception	= self.exceptions[exc]
+			crash_code 	= exc
+			crash_desc	= exception[code]['desc']
+
+		elif exc in self.exceptions:
+			exception 	= self.exceptions[exc]
+			crash_code 	= exception[code]['title']
+			crash_desc	= exception[code]['desc']
+		
+		return crash_code, crash_desc
+		
 	def flag_register_to_human(self, val=None):
 		reg = self.flag_register
 		if not val:
@@ -2917,20 +3076,63 @@ class X8664(Architecture):
 			
 		return 0
 
-	def access_type(self, insn):
+	def get_access_type(self, insn):
 		operands = insn.operands
 		mnemonic = insn.mnemonic
 
-		pass
+		operand_values = {}
+		if operands.count:
+			for i in insn.operands:
+				if i.reg:
+					reg 	= insn.reg_name(i.reg)
+					val 	= self.get_register(reg)
+					operand_values[reg] = val
 
-	def get_disas(self, frame, process):
-		pc = get_register("rip", frame)
+		print(insn.groups)
+
+	def get_disas(self, frame, process, pc=None):
+		if not pc:
+			pc 		= frame.pc
+
 		error = lldb.SBError()
 		buffer = process.ReadMemory(pc, 20, error)
 		
 		cs = Cs(CS_ARCH_X86, CS_MODE_64)
 		cs.detail   = True
+		
 		return cs.disasm(buffer, pc)
+
+	def get_disas_to_print(self, frame, process, pc=None):
+		if pc==None:
+			pc = frame.pc
+		
+		instructions = list(self.get_disas(frame, process, pc))
+
+		if instructions == []:
+			return "", False, None
+
+		insn = instructions[0]
+
+		av_access_type 	= self.get_access_type(insn)
+		av_on_branch 	= False
+
+		for g in insn.groups:
+			if g == x86_const.X86_GRP_JUMP or g == x86_const.X86_GRP_BRANCH_RELATIVE:
+				av_on_branch = True
+
+		disassembly_operands	=	""
+		for i in insn.operands:
+			if i.reg:
+				reg 	= insn.reg_name(i.reg)
+				val 	= self.get_register(reg)
+				disassembly_operands += f"{reg}={val:x}; "
+
+		if disassembly_operands:
+			disassembly	=	f"{insn.mnemonic}\t{insn.op_str} => {disassembly_operands}"		
+		else:
+			disassembly	=	f"{insn.mnemonic}\t{insn.op_str}"
+
+		return disassembly, av_on_branch, av_access_type
 		
 	def disasm(self, address, buffer, pc):
 		cs = Cs(CS_ARCH_X86, CS_MODE_64)
@@ -3119,7 +3321,7 @@ class CapstoneDisassembleCommand(LLDBCommand):
 		target 	= lldb.debugger.GetSelectedTarget()
 		process = target.process
 		thread 	= process.selected_thread
-		frame 	= thread.GetFrameAtIndex(0)
+		frame 	= thread.GetSelectedFrame()
 		address	= frame.pc
 
 		if arguments[0]:
@@ -3187,8 +3389,12 @@ class ContextCommand(LLDBCommand):
 		arch = get_target_arch()
 
 		if arch:
+			context_title("stack")
+			run_command("rstack")
+
 			context_title("registers")
 			arch.print_registers(frame)
+
 			context_title("code")
 			arch.disasm(address, buffer, frame.pc)
 
@@ -3333,8 +3539,8 @@ class DumpStackCommand(LLDBCommand):
 	
 	@process_is_alive
 	def run(self, arguments, option):
-		target 	= lldb.debugger.GetSelectedTarget()
-		process = target.process
+		self.target 	= lldb.debugger.GetSelectedTarget()
+		process = self.target.process
 		stack_size = 128
 
 		if arguments[0]:
@@ -3353,17 +3559,56 @@ class DumpStackCommand(LLDBCommand):
 			self.print_stack(stack_size, 0, thread, process)
 
 	def print_stack(self, stack_size, frame_id, thread, process):
-
+		
 		frame 	= thread.GetFrameAtIndex(frame_id)
 		address	= frame.sp
 		
 		error = lldb.SBError()
 		buffer = process.ReadMemory(address, stack_size, error)
-
+		
 		arch = get_target_arch()
 		if buffer:
-			hexdump(buffer, address)
+			HEADER = '┌────────────────┬─────────────────────────┬──────────┐'
+			FOOTER = RST+'└────────────────┴─────────────────────────┴──────────┘'
+			LINE_FORMATTER = '│' + '' + '{:016x}' + '│ {}' + '{}'  + ' │' + RST+' => {}' + RST
 
+			cache = {hexmod(b): colored(b) for b in range(256)} #0x00 - 0xff
+			cache['  '] = ('  ', ' ')
+
+			print(HEADER)
+			cur = 0
+			row = address
+			line = buffer[cur:cur+8]
+			
+
+			while line:
+				chain_display = ""
+				addr = struct.unpack("<Q", line)[0]
+				taddr = self.target.ResolveLoadAddress(addr)
+				if taddr.IsValid:
+					chain = dereference(addr)
+					if chain:
+						for i,j in get_deref_chain_as_string(chain):
+							chain_display += f"{i}{j}"
+
+				line_hex = line.hex().ljust(16)
+				
+				hexbytes = ''
+				printable = ''
+				for i in range(0, len(line_hex), 2):
+					hbyte, abyte = cache[line_hex[i:i+2]]
+					hexbytes += hbyte + ' ' if i != 14 else hbyte + ' ┊ '
+					printable += abyte if i != 14 else abyte 
+
+				print(LINE_FORMATTER.format(row, hexbytes, printable, chain_display))
+				
+				row += 0x10
+				cur += 0x10
+				line = buffer[cur:cur+8]
+			
+			print(FOOTER)
+
+	
 class DisplayMemoryCommand(LLDBCommand):
 	def name(self):
 		return "pmem"
@@ -3572,6 +3817,7 @@ class ExploitableCommand(LLDBCommand):
 			thread 	= process.GetThreadByIndexID(tid)
 
 		frame 	= thread.GetFrameAtIndex(0)
+		pc 		= frame.pc
 		arch 	= get_target_arch()
 
 		if thread.GetStopReason() == lldb.eStopReasonException:
@@ -3583,36 +3829,33 @@ class ExploitableCommand(LLDBCommand):
 
 			if is_recursion:
 				code = int(code)
-				exception 	= arch.exceptions[exc]
-				crash_code 	= exception[code]['title']
-				crash_desc	= exception[code]['desc']
+				# exception 	= arch.exceptions[exc]
+				# crash_code 	= exception[code]['title']
+				# crash_desc	= exception[code]['desc']
+				crash_code, crash_desc = arch.get_code_desc(exc, code)
+
 				av_access_type	  	= "recursion"
 				av_is_exploitable 	= False
 				exploit_reason 		= f"The crash is suspected to be due to unbounded recursion since there were more than {MINIMUM_RECURSION_LENGTH} stack frames"
-
-				instructions = arch.get_disas(frame, process)
-				insn = list(instructions)[0]
-
-				disassembly_operands	=	""
-				for i in insn.operands:
-					reg 	= insn.reg_name(i.reg)
-					val 	= arch.get_register(reg)
-					disassembly_operands += f"{reg}={val:x}; "
-
-				disassembly	=	f"{insn.mnemonic}\t{insn.op_str} => {disassembly_operands}"
+				disassembly, _, _ = arch.get_disas_to_print(frame, process)
 
 			elif stack_suspicious:
-				# exploit_reason = ""
-				# av_is_exploitable	= True
-				# if 
-				pass
+				exploit_reason 		= "The crash is suspected to be an exploitable issue due to the suspicious function in the stack trace of the crashing thread."
+				av_is_exploitable	= True
+				code = int(code)
+				# exception 	= arch.exceptions[exc]
+				# crash_code 	= exception[code]['title']
+				# crash_desc	= exception[code]['desc']
+				crash_code, crash_desc = arch.get_code_desc(exc, code)
+				disassembly, _, _	= arch.get_disas_to_print(frame, process)
 
 			elif not is_recursion and exc == "EXC_BAD_ACCESS":
 				if code and extra:
 					code = int(code)
-					exception 	= arch.exceptions[exc]
-					crash_code 	= exception[code]['title']
-					crash_desc	= exception[code]['desc']
+					# exception 	= arch.exceptions[exc]
+					# crash_code 	= exception[code]['title']
+					# crash_desc	= exception[code]['desc']
+					crash_code, crash_desc = arch.get_code_desc(exc, code)
 
 					access_address = int(extra, 16)
 
@@ -3636,18 +3879,7 @@ class ExploitableCommand(LLDBCommand):
 					#it's either a read or a write
 					else:
 						max_offset	 = 1024
-
-						instructions = arch.get_disas(frame, process)
-						insn = list(instructions)[0]
-						av_access_type = arch.access_type(insn)
-						
-						disassembly_operands	=	""
-						for i in insn.operands:
-							reg 	= insn.reg_name(i.reg)
-							val 	= arch.get_register(reg)
-							disassembly_operands += f"{reg}={val:x}; "
-
-						disassembly	=	f"{insn.mnemonic}\t{insn.op_str} => {disassembly_operands}"
+						disassembly, av_on_branch, av_access_type	= arch.get_disas_to_print(frame, process)
 
 						if is_near_null(access_address):
 							av_is_exploitable 	= False
@@ -3673,27 +3905,12 @@ class ExploitableCommand(LLDBCommand):
 							exploit_reason		= f"Crash writing to invalid address {RED}{access_address:x}{RST}"
 
 					if av_access_type == "exec":
-						# let's see who called this?
+						# let's see who caused this?
 						if thread.GetNumFrames() >= 2:
 							frame1 = thread.GetFrameAtIndex(frame.idx+1)
 							pc 	   = frame1.pc
 							previous_pc = arch.get_previous_pc(pc, frame1, pc)
-
-							instructions = arch.get_disas(frame1, process, previous_pc)
-							insn = list(instructions)[0]
-							for g in insn.groups:
-								if g == arm64_const.ARM64_GRP_BRANCH_RELATIVE or g == arm64_const.ARM64_GRP_CALL or g == arm64_const.ARM64_GRP_JUMP:
-									av_on_branch = True
-								elif g == x86_const.X86_GRP_JUMP or g == x86_const.X86_GRP_BRANCH_RELATIVE:
-									av_on_branch = True
-
-							disassembly_operands	=	""
-							for i in insn.operands:
-								reg 	= insn.reg_name(i.reg)
-								val 	= arch.get_register(reg)
-								disassembly_operands += f"{reg}={val:x}; "
-
-							disassembly	=	f"{insn.mnemonic}\t{insn.op_str} => {disassembly_operands}"
+							disassembly, av_on_branch, _	= arch.get_disas_to_print(frame1, process, previous_pc)
 
 				elif code == "EXC_I386_GPFLT":
 					# //When the address would be invalid in the 64-bit ABI, we get a EXC_I386_GPFLT and 
@@ -3714,17 +3931,26 @@ class ExploitableCommand(LLDBCommand):
 				#     0x7fff2036a0fe <+1>:  movq   %rsp, %rbp
 				#     0x7fff2036a101 <+4>:  leaq   0x9c35(%rip), %rdi        ; "detected buffer overflow"
 				#     0x7fff2036a108 <+11>: callq  0x7fff2036abc3            ; _os_crash
-				# ->  0x7fff2036a10d <+16>: ud2    
-				pass
+				# ->  0x7fff2036a10d <+16>: ud2
+				crash_code, crash_desc = arch.get_code_desc(exc, code)
+				disassembly, _, _	= arch.get_disas_to_print(frame, process, pc)
+
 
 			elif exc == "EXC_ARITHMETIC":
-				exception 	= arch.exceptions[exc]
-				crash_code	=	code
-				crash_desc	=	exception[code]['desc']
-
+				crash_code, crash_desc = arch.get_code_desc(exc, code)
+				exploit_reason 	= f"Arithmetic exception at {pc:016x}, probably not exploitable."
+				disassembly, _, av_access_type 	= arch.get_disas_to_print(frame, process)
+			
 		elif thread.GetStopReason() == lldb.eStopReasonSignal:
-			pass
-		
+			av_exception = thread.GetStopDescription(1024)
+			stack_suspicious = is_stack_suspicious(thread, None, None, None)
+			crash_code		 = av_exception.split(' ')[1]
+
+			if stack_suspicious:
+				exploit_reason 		= "The crash is suspected to be an exploitable issue due to the suspicious function in the stack trace of the crashing thread."
+				av_is_exploitable	= True
+				disassembly, _, _	= arch.get_disas_to_print(frame, process)
+			
 		print(f"crash_code		: {GRN}{crash_code}{RST}")
 		print(f"crash_desc		: {crash_desc}")
 		print(f"av_on_branch		: {YEL}{av_on_branch}{RST}")
@@ -3738,6 +3964,34 @@ class ExploitableCommand(LLDBCommand):
 		print(f"av_is_exploitable 	: {av_is_exploitable}")
 		print(f"exploit_reason		: {exploit_reason}")
 		print(f"disassembly		: {disassembly}")
+
+class InstructionManualCommand(LLDBCommand):
+	def name(self):
+		return "man"
+	
+	def description(self):
+		return "Full Instruction Reference Plugin (idaref)"
+	
+	def args(self):
+		return [
+			CommandArgument(
+				arg="instruction",
+				type="str",
+				help="instruction to search",
+			),
+			CommandArgument(
+				arg="arch",
+				type="str",
+				help="Architecture of the instruction. By default, uses Arch of selected target.",
+			)
+		]
+
+	def run(self, arguments, option):
+		if not arguments[1]:
+			arch = get_target_arch()
+		
+		if not arguments[0]:
+			current_instruction = ""
 
 
 def __lldb_init_module(debugger, dict):
@@ -3767,6 +4021,7 @@ def __lldb_init_module(debugger, dict):
 	load_command(current_module, ReadMemoryCommand(), "lisa")
 	load_command(current_module, PrettyBacktraceCommand(), "lisa")
 	load_command(current_module, ExploitableCommand(), "lisa")
+	load_command(current_module, InstructionManualCommand(), "lisa")
 
 	command_iterpreter.HandleCommand("target stop-hook add --one-liner 'context'", res)
 	command_iterpreter.HandleCommand("command alias ct context", res)

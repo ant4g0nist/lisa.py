@@ -7,11 +7,14 @@
   checksec    -- Display the security properties of the current executable
   context     -- Display context of given thread or selected thread by default. Usage: 'context all' or 'context 1'
   csdis       -- Disassemble buffer at a given pointer using Capstone
+  exploitable -- Check if the current exception context is exploitable
+  man         -- Full Instruction Reference Plugin (idaref)
   pbt         -- Pretty print backtrace
   pmem        -- Visualize memory at a given address and size
   pstack      -- Visualize stack for a given frame or selected frame by default
   rmem        -- Hexdump memory at a given address and size
   rr          -- Display registers for a given thread and frame or selected thread and selected frame by default
+  rstack      -- Hexdump stack for a given frame or selected frame by default
   show_header -- Dump Mach-O headers
   show_lc     -- Dump Load Commands from Mach-O
 ```
@@ -72,6 +75,7 @@ Restricted 	 : True (Authority=Software Signing)
 
 ### Credits
 
+- [voltron](https://github.com/snare/voltron)
 - [lldb](https://lldb.llvm.org/)
 - [chisel](https://github.com/facebook/chisel)
 - [gef](https://github.com/hugsy/gef)
