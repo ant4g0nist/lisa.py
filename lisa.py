@@ -12,29 +12,27 @@ import shlex
 import string
 import struct
 import fnmatch
+import pathlib
+import sqlite3
 import termios
 import capstone
+import optparse
 import platform
 import functools
 import subprocess
-from capstone import *
-from capstone import arm64_const
-from capstone import x86_const
-from optparse import OptionParser
 
 BLK = "\033[30m"
-RED = "\033[31m"
-GRN = "\033[32m"
-YEL = "\033[33m"
 BLU = "\033[34m"
-MAG = "\033[35m"
 CYN = "\033[36m"
-WHT = "\033[37m"
+GRN = "\033[32m"
+MAG = "\033[35m"
+RED = "\033[31m"
 RST = "\033[0m"
+YEL = "\033[33m"
+WHT = "\033[37m"
 BASE00 = '#657b83'
-Punctuation = BASE00
-HORIZONTAL_LINE = "\u2500"
 VERTICAL_LINE = "\u2502"
+HORIZONTAL_LINE = "\u2500"
 
 __prompt__ = f"'(lisa:>) '"
 
@@ -117,6 +115,46 @@ def get_target_arch():
 		return X8664()
 	else:
 		errlog(f"Architecture {arch} not supported")
+
+def load_manual():
+	global inst_map
+	inst_map = {}
+
+	archs = ["arm", "x86_64"]
+
+	for arch in archs:
+		path 	= pathlib.Path(__file__).parent.absolute()
+		dbpath 	= os.path.join(path, "archs", arch + ".sql")
+
+		con = sqlite3.connect(":memory:")
+		con.text_factory = str
+		con.executescript(open(dbpath).read())
+
+		cur = con.cursor()
+		cur.execute("SELECT mnem, description FROM instructions")
+		con.commit()
+
+		rows = cur.fetchall()
+		for row in rows:
+			inst = row[0]
+			lines = row[1].replace("\r\n", "\n").split("\n")
+
+			inst_map[inst] = lines
+
+		con.close()
+
+		for (inst, data) in inst_map.items():
+			data = data[0]
+
+			if data[0:3] == "-R:":
+				ref = data[3:]
+
+				if ref in inst_map:
+					inst_map[inst] = inst_map[ref]
+
+		dlog(f"Manual loaded for architecture: {arch}")
+	
+	return True
 
 def run_shell_command(command, shell=True):
 	return subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=shell)
@@ -207,7 +245,7 @@ def validate_args_for_command(args, command):
 
 
 def option_parser_for_command(command):
-	parser = OptionParser()
+	parser = optparse.OptionParser()
 
 	for argument in command.options():
 		if argument.boolean:
@@ -2594,8 +2632,8 @@ def capstone_analyze_pc(current_arch, insn, nb_insn):
 	return (False, "")
 
 class AARCH64(Architecture):
-	arch = "ARM64"
-	mode = "ARM"
+	arch = "aarch64"
+	mode = "arm"
 	
 	flag_register = "cpsr"
 
@@ -2813,7 +2851,7 @@ class AARCH64(Architecture):
 		error 	= lldb.SBError()
 		buffer 	= process.ReadMemory(pc, 20, error)
 
-		cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+		cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
 		cs.detail   = True
 		
 		return cs.disasm(buffer, pc)
@@ -2832,16 +2870,16 @@ class AARCH64(Architecture):
 		av_on_branch = False
 		
 		for g in insn.groups:
-			if g == arm64_const.ARM64_GRP_BRANCH_RELATIVE or g == arm64_const.ARM64_GRP_CALL or g == arm64_const.ARM64_GRP_JUMP:
+			if g == capstone.arm64_const.ARM64_GRP_BRANCH_RELATIVE or g == capstone.arm64_const.ARM64_GRP_CALL or g == capstone.arm64_const.ARM64_GRP_JUMP:
 				av_on_branch = True
 
 		disassembly_operands	=	""
 		for i in insn.operands:
-			if i.type== arm64_const.ARM64_OP_REG:
+			if i.type == capstone.arm64_const.ARM64_OP_REG:
 				reg 	= insn.reg_name(i.reg)
 				val 	= self.get_register(reg)
 				disassembly_operands += f"{reg}={val:x}; "
-			elif i.type == arm64_const.ARM64_OP_MEM:
+			elif i.type == capstone.arm64_const.ARM64_OP_MEM:
 				if i.reg:
 					reg 	= insn.reg_name(i.reg)
 					val 	= self.get_register(reg)
@@ -2855,7 +2893,7 @@ class AARCH64(Architecture):
 		return disassembly, av_on_branch, av_access_type
 
 	def disasm(self, address, buffer, pc):
-		cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+		cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
 		cs.detail   = True
 		
 		instuctions = cs.disasm(buffer, address)
@@ -2890,7 +2928,7 @@ class AARCH64(Architecture):
 		
 class X8664(Architecture):
 	arch = "X86"
-	mode = "64"
+	mode = "x86_64"
 
 	syscall_register = "rax"
 	syscall_instructions = ["syscall"]
@@ -3019,7 +3057,7 @@ class X8664(Architecture):
 		elif mnemo in ("jbe", "jna"):
 			taken, reason = val&(1<<flags["carry"]) or val&(1<<flags["zero"]), "C || Z"
 		elif mnemo in ("jcxz", "jecxz", "jrcxz"):
-			cx = get_register("$rcx") if self.mode == 64 else get_register("$ecx")
+			cx = get_register("$rcx")
 			taken, reason = cx == 0, "!$CX"
 		elif mnemo in ("je", "jz"):
 			taken, reason = val&(1<<flags["zero"]), "Z"
@@ -3097,7 +3135,7 @@ class X8664(Architecture):
 		error = lldb.SBError()
 		buffer = process.ReadMemory(pc, 20, error)
 		
-		cs = Cs(CS_ARCH_X86, CS_MODE_64)
+		cs = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
 		cs.detail   = True
 		
 		return cs.disasm(buffer, pc)
@@ -3117,7 +3155,7 @@ class X8664(Architecture):
 		av_on_branch 	= False
 
 		for g in insn.groups:
-			if g == x86_const.X86_GRP_JUMP or g == x86_const.X86_GRP_BRANCH_RELATIVE:
+			if g == capstone.x86_const.X86_GRP_JUMP or g == capstone.x86_const.X86_GRP_BRANCH_RELATIVE:
 				av_on_branch = True
 
 		disassembly_operands	=	""
@@ -3127,6 +3165,18 @@ class X8664(Architecture):
 				val 	= self.get_register(reg)
 				disassembly_operands += f"{reg}={val:x}; "
 
+		disassembly_operands	=	""
+		for i in insn.operands:
+			if i.type == capstone.x86_const.X86_OP_REG:
+				reg 	= insn.reg_name(i.reg)
+				val 	= self.get_register(reg)
+				disassembly_operands += f"{reg}={val:x}; "
+			elif i.type == capstone.x86_const.X86_OP_MEM:
+				if i.reg:
+					reg 	= insn.reg_name(i.reg)
+					val 	= self.get_register(reg)
+					disassembly_operands += f"{reg}={val:x}; "
+
 		if disassembly_operands:
 			disassembly	=	f"{insn.mnemonic}\t{insn.op_str} => {disassembly_operands}"		
 		else:
@@ -3135,7 +3185,7 @@ class X8664(Architecture):
 		return disassembly, av_on_branch, av_access_type
 		
 	def disasm(self, address, buffer, pc):
-		cs = Cs(CS_ARCH_X86, CS_MODE_64)
+		cs = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
 		cs.detail   = True
 
 		instuctions = cs.disasm(buffer, address)
@@ -3966,6 +4016,7 @@ class ExploitableCommand(LLDBCommand):
 		print(f"disassembly		: {disassembly}")
 
 class InstructionManualCommand(LLDBCommand):
+	
 	def name(self):
 		return "man"
 	
@@ -3986,13 +4037,59 @@ class InstructionManualCommand(LLDBCommand):
 			)
 		]
 
-	def run(self, arguments, option):
-		if not arguments[1]:
-			arch = get_target_arch()
-		
-		if not arguments[0]:
-			current_instruction = ""
+	def cleanInstruction(self, arch, inst):
+		# mneminic
+		if arch == "x86_64":
+			inst = inst.upper()
+			# hacks for x86
+			if inst[0:1] == "J" and inst != "JMP":
+				inst = "Jcc"
+			elif inst[0:4] == "LOOP":
+				inst = "LOOP"
+			elif inst[0:3] == "INT":
+				inst = "INT n"
+			elif inst[0:5] == "FCMOV":
+				inst = "FCMOVcc"
+			elif inst[0:4] == "CMOV":
+				inst = "CMOVcc"
+			elif inst[0:3] == "SET":
+				inst = "SETcc"
 
+		return inst
+
+	def run(self, arguments, option):
+		target 	= lldb.debugger.GetSelectedTarget()
+		process = target.GetProcess()
+		thread 	= process.GetSelectedThread()
+		frame 	= thread.GetSelectedFrame()
+
+		insn = arguments[0]
+		arch = arguments[1]
+
+		if not arch:
+			arch = get_target_arch().mode
+		
+		if not insn:
+			tarch = get_target_arch()
+			address = frame.pc
+			instructions = list(tarch.get_disas(frame, process))
+			if instructions:
+				insn = instructions[0].mnemonic
+
+		insn = self.cleanInstruction(arch, insn)
+		if insn not in inst_map:
+			insn = insn.upper()
+
+		if insn in inst_map:
+			text = inst_map[insn]
+			if len(text) > 0:
+				dlog(insn + ": " + text[0]),
+				if len(text) > 1:
+					for line in text[1:]:
+						if line:
+							dlog(line),
+		else:
+			errlog(insn + " not documented.")
 
 def __lldb_init_module(debugger, dict):
 	context_title(" lisa ")
@@ -4009,19 +4106,21 @@ def __lldb_init_module(debugger, dict):
 	current_module._loadedFunctions = {}
 
 	load_command(current_module, ASLRCommand(), "lisa")
-	load_command(current_module, ChecksecCommand(), "lisa")
-	load_command(current_module, DisplayMachoHeaderCommand(), "lisa")
-	load_command(current_module, DisplayMachoLoadCmdCommand(), "lisa")
-	load_command(current_module, CapstoneDisassembleCommand(), "lisa")
 	load_command(current_module, ContextCommand(), "lisa")
-	load_command(current_module, RegisterReadCommand(), "lisa")
-	load_command(current_module, DisplayStackCommand(), "lisa")
+	load_command(current_module, ChecksecCommand(), "lisa")
 	load_command(current_module, DumpStackCommand(), "lisa")	
-	load_command(current_module, DisplayMemoryCommand(), "lisa")
 	load_command(current_module, ReadMemoryCommand(), "lisa")
-	load_command(current_module, PrettyBacktraceCommand(), "lisa")
 	load_command(current_module, ExploitableCommand(), "lisa")
+	load_command(current_module, DisplayStackCommand(), "lisa")
+	load_command(current_module, RegisterReadCommand(), "lisa")
+	load_command(current_module, DisplayMemoryCommand(), "lisa")
+	load_command(current_module, PrettyBacktraceCommand(), "lisa")
 	load_command(current_module, InstructionManualCommand(), "lisa")
+	load_command(current_module, DisplayMachoHeaderCommand(), "lisa")
+	load_command(current_module, CapstoneDisassembleCommand(), "lisa")
+	load_command(current_module, DisplayMachoLoadCmdCommand(), "lisa")
+
+	load_manual()
 
 	command_iterpreter.HandleCommand("target stop-hook add --one-liner 'context'", res)
 	command_iterpreter.HandleCommand("command alias ct context", res)
