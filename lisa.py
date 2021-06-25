@@ -54,21 +54,18 @@ dlog    = lambda msg: print(f"{GRN}{msg}{RST}")
 warnlog	= lambda msg: print(f"{YEL}{msg}{RST}")
 errlog	= lambda msg: print(f"{RED}{msg}{RST}")
 
-tty_rows, tty_columns = struct.unpack("hh", fcntl.ioctl(1, termios.TIOCGWINSZ, "1234"))
+_, tty_columns = struct.unpack("hh", fcntl.ioctl(1, termios.TIOCGWINSZ, "1234"))
 
-def context_title(m):
+def contextTitle(m=None):
 	line_color= YEL
 	msg_color = GRN
 
 	if not m:
-		print(f"{line_color}{HORIZONTAL_LINE * tty_columns} {line_color}{RST}")
+		print(f"{line_color}{HORIZONTAL_LINE * (tty_columns)} {line_color}{RST}")
 		return
 
-	trail_len = len(m) + 8
-	title = ""
-	title += line_color+" {:{padd}<{width}} ".format("", width=max(tty_columns - trail_len, 0), padd=HORIZONTAL_LINE)+RST
-	title += f"{msg_color}{m}{RST}"
-	title += line_color+" {:{padd}<4}".format("", padd=HORIZONTAL_LINE)+RST
+	trail_len = int((tty_columns - len(m)  - 4)/2)
+	title = f"{line_color}{'-'*(trail_len)}{GRN}[ {RED}{m} {GRN}]{line_color}{'-'*(trail_len)}{RST}"
 	print(title)
 
 def get_host_pagesize():
