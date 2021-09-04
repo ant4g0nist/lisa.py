@@ -835,7 +835,7 @@ MH_CIGAM_64 = 0xcffaedfe
 FAT_MAGIC = 0xcafebabe
 FAT_CIGAM = 0xbebafeca
 
-# Mach haeder "filetype" constants
+# Mach header "filetype" constants
 MH_OBJECT = 0x00000001
 MH_EXECUTE = 0x00000002
 MH_FVMLIB = 0x00000003
@@ -848,7 +848,7 @@ MH_DYLIB_STUB = 0x00000009
 MH_DSYM = 0x0000000a
 MH_KEXT_BUNDLE = 0x0000000b
 
-# Mach haeder "flag" constant bits
+# Mach header "flag" constant bits
 MH_NOUNDEFS = 0x00000001
 MH_INCRLINK = 0x00000002
 MH_DYLDLINK = 0x00000004
@@ -2343,7 +2343,7 @@ def run_command(command):
 
 # execute command and return output
 def run_command_return_output(debugger,lldb_command, result, dict):
-	"""Execute given command and returns the outout"""
+	"""Execute given command and returns the output"""
 	res = lldb.SBCommandReturnObject()
 	command_iterpreter.HandleCommand(lldb_command,res)
 	output = res.GetOutput()
