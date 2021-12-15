@@ -36,7 +36,7 @@ Syntax: aslr <on/off>
 
 This command is implemented as ASLRCommand
 ```  
-<img src="resources/imgs/aslr.png" alt="aslr.png" width="200"/>
+<img src="resources/imgs/aslr.png" alt="aslr.png"/>
 
 ## checksec
 - Display the security properties of the current executable
@@ -54,7 +54,7 @@ Syntax: checksec <macho>
 
 This command is implemented as ChecksecCommand
 ```
-<img src="resources/imgs/checksec.png" alt="checksec.png" width="200"/>
+<img src="resources/imgs/checksec.png" alt="checksec.png"/>
 
 ## context
 - Display context of given thread or selected thread by default. Usage: 'context all' or 'context 1'
