@@ -4,6 +4,7 @@ import re
 import abc
 import cmd
 import sys
+import json
 import lldb
 import stat
 import uuid
@@ -11,6 +12,7 @@ import fcntl
 import shlex
 import string
 import struct
+import hashlib
 import fnmatch
 import pathlib
 import sqlite3
@@ -54,18 +56,24 @@ dlog    = lambda msg: print(f"{GRN}{msg}{RST}")
 warnlog	= lambda msg: print(f"{YEL}{msg}{RST}")
 errlog	= lambda msg: print(f"{RED}{msg}{RST}")
 
-_, tty_columns = struct.unpack("hh", fcntl.ioctl(1, termios.TIOCGWINSZ, "1234"))
+try:
+	tty_rows, tty_columns = struct.unpack("hh", fcntl.ioctl(1, termios.TIOCGWINSZ, "1234"))
+except:
+	tty_rows, tty_columns = 120, 120
 
-def contextTitle(m=None):
+def context_title(m):
 	line_color= YEL
 	msg_color = GRN
 
 	if not m:
-		print(f"{line_color}{HORIZONTAL_LINE * (tty_columns)} {line_color}{RST}")
+		print(f"{line_color}{HORIZONTAL_LINE * tty_columns} {line_color}{RST}")
 		return
 
-	trail_len = int((tty_columns - len(m)  - 4)/2)
-	title = f"{line_color}{'-'*(trail_len)}{GRN}[ {RED}{m} {GRN}]{line_color}{'-'*(trail_len)}{RST}"
+	trail_len = len(m) + 8
+	title = ""
+	title += line_color+" {:{padd}<{width}} ".format("", width=max(tty_columns - trail_len, 0), padd=HORIZONTAL_LINE)+RST
+	title += f"{msg_color}{m}{RST}"
+	title += line_color+" {:{padd}<4}".format("", padd=HORIZONTAL_LINE)+RST
 	print(title)
 
 def get_host_pagesize():
@@ -80,7 +88,7 @@ def get_host_pagesize():
 		page_size = run_shell_command('arch -x86_64 getconf PAGE_SIZE').stdout.rstrip()
 	else:
 		errlog("get_host_pagesize failed")
-		return -1
+		return 16384
 
 	return int(page_size)
 
@@ -121,7 +129,7 @@ def load_manual():
 
 	for arch in archs:
 		path 	= pathlib.Path(__file__).parent.absolute()
-		dbpath 	= os.path.join(path, "archs", arch + ".sql")
+		dbpath 	= os.path.join(path, "resources/archs", arch + ".sql")
 
 		con = sqlite3.connect(":memory:")
 		con.text_factory = str
@@ -2342,7 +2350,7 @@ def run_command(command):
 	lldb.debugger.HandleCommand(command)
 
 # execute command and return output
-def run_command_return_output(debugger,lldb_command, result, dict):
+def run_command_return_output(lldb_command):
 	"""Execute given command and returns the outout"""
 	res = lldb.SBCommandReturnObject()
 	command_iterpreter.HandleCommand(lldb_command,res)
@@ -2465,7 +2473,7 @@ def parse_stopDescription(description):
 	or like 'EXC_I386_GPFLT') and Extra as a string (can be an address
 	'0x00000000' or a subcode '0x0')
 	'''
-
+	# EXC_RESOURCE RESOURCE_TYPE_MEMORY (limit=1000 MB, unused=0x0)
 	# EXC_BAD_ACCESS (code=2, address=0x100804000)
 	# EXC_BAD_ACCESS (code=EXC_I386_GPFLT)
 	# EXC_BAD_INSTRUCTION (code=EXC_I386_INVOP, subcode=0x0)
@@ -2478,6 +2486,10 @@ def parse_stopDescription(description):
 		return None, None, None
 
 	fields = desc.split()
+	if "EXC_RESOURCE" in description:
+		exc, code, extra = description.split(" ", 2)
+		return [exc, code, extra]
+
 	exc = fields[0]
 	code = fields[1].split("=", 2)[1]
 	extra = None
@@ -2695,13 +2707,14 @@ class AARCH64(Architecture):
 
 	def get_code_desc(self, exc, code):
 		crash_code, crash_desc = None, None
-
+		
 		if exc in ['EXC_BAD_INSTRUCTION']:
 			exception	= self.exceptions[exc]
 			crash_code 	= exc
 			crash_desc	= exception[code]['desc']
 
 		elif exc in self.exceptions:
+			code = int(code)
 			exception 	= self.exceptions[exc]
 			crash_code 	= exception[code]['title']
 			crash_desc	= exception[code]['desc']
@@ -2875,7 +2888,10 @@ class AARCH64(Architecture):
 			if i.type == capstone.arm64_const.ARM64_OP_REG:
 				reg 	= insn.reg_name(i.reg)
 				val 	= self.get_register(reg)
-				disassembly_operands += f"{reg}={val:x}; "
+				if val:
+					disassembly_operands += f"{reg}={val:x}; "
+				else:
+					disassembly_operands += f"{reg}; "
 			elif i.type == capstone.arm64_const.ARM64_OP_MEM:
 				if i.reg:
 					reg 	= insn.reg_name(i.reg)
@@ -2889,9 +2905,9 @@ class AARCH64(Architecture):
 
 		return disassembly, av_on_branch, av_access_type
 
-	def disasm(self, address, buffer, pc):
+	def disasm(self, address, buffer, pc, lldb_result=None):
 		cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
-		cs.detail   = True
+		cs.detail  = True
 		
 		instuctions = cs.disasm(buffer, address)
 		try:
@@ -2901,6 +2917,15 @@ class AARCH64(Architecture):
 			return
 
 		for i in instuctions:
+			(regs_read, regs_write) = i.regs_access()
+			written = f""
+			for r in regs_write:
+				written += f"{i.reg_name(r)}"
+
+			read = f""
+			for r in regs_read:
+				read += f"{i.reg_name(r)}"
+
 			if i.address == pc:
 				msg = ""
 				if self.is_conditional_branch(i):
@@ -2911,9 +2936,9 @@ class AARCH64(Architecture):
 
 				print(msg)
 			else:
-				print(f"   {i.address:x}{RED} :\t{GRN}{i.mnemonic}{RST}\t{i.op_str}")
+				print(f"   {i.address:x}{RED} : {GRN}{i.mnemonic}{RST}\t{i.op_str:<25};\t{RED}WRITE{RST}: {written:<10}\t{GRN}READ{RST}: {read}")
 
-	def print_registers(self, frame):
+	def print_registers(self, frame, result=None):
 		print("$x0  : 0x%016x   $x1  : 0x%016x    $x2 : 0x%016x    $x3 : 0x%016x"%(get_register("X0", frame),  get_register("X1", frame),  get_register("X2", frame),  get_register("X3", frame)))
 		print("$x4  : 0x%016x   $x5  : 0x%016x    $x6 : 0x%016x    $x7 : 0x%016x"%(get_register("X4", frame),  get_register("X5", frame),  get_register("X6", frame),  get_register("X7", frame)))
 		print("$x8  : 0x%016x   $x9  : 0x%016x   $x10 : 0x%016x   $x11 : 0x%016x"%(get_register("X8", frame),  get_register("X9", frame),  get_register("X10", frame),  get_register("X11", frame)))
@@ -2922,7 +2947,16 @@ class AARCH64(Architecture):
 		print("$x26 : 0x%016x   $x27 : 0x%016x   $x28 : 0x%016x   "%(get_register("X26", frame),  get_register("X27", frame),  get_register("X28", frame)))
 		print("$fp  : 0x%016x    $lr : 0x%016x    $pc : 0x%016x"%(get_register("FP", frame),  get_register("LR", frame),  get_register("PC", frame)))
 		print("CPSR : 0x%016x    "%(get_register("CPSR", frame)))
-		
+		if result:
+			result.PutCString("$x0  : 0x%016x   $x1  : 0x%016x    $x2 : 0x%016x    $x3 : 0x%016x"%(get_register("X0", frame),  get_register("X1", frame),  get_register("X2", frame),  get_register("X3", frame)))
+			result.PutCString("$x4  : 0x%016x   $x5  : 0x%016x    $x6 : 0x%016x    $x7 : 0x%016x"%(get_register("X4", frame),  get_register("X5", frame),  get_register("X6", frame),  get_register("X7", frame)))
+			result.PutCString("$x8  : 0x%016x   $x9  : 0x%016x   $x10 : 0x%016x   $x11 : 0x%016x"%(get_register("X8", frame),  get_register("X9", frame),  get_register("X10", frame),  get_register("X11", frame)))
+			result.PutCString("$x12 : 0x%016x   $x13 : 0x%016x   $x14 : 0x%016x   $x15 : 0x%016x"%(get_register("X12", frame),  get_register("X13", frame),  get_register("X14", frame),  get_register("X15", frame)))
+			result.PutCString("$x18 : 0x%016x   $x19 : 0x%016x   $x20 : 0x%016x   $x21 : 0x%016x"%(get_register("X18", frame),  get_register("X23", frame),  get_register("X24", frame),  get_register("X25", frame)))
+			result.PutCString("$x26 : 0x%016x   $x27 : 0x%016x   $x28 : 0x%016x   "%(get_register("X26", frame),  get_register("X27", frame),  get_register("X28", frame)))
+			result.PutCString("$fp  : 0x%016x    $lr : 0x%016x    $pc : 0x%016x"%(get_register("FP", frame),  get_register("LR", frame),  get_register("PC", frame)))
+			result.PutCString("CPSR : 0x%016x    "%(get_register("CPSR", frame)))
+
 class X8664(Architecture):
 	arch = "X86"
 	mode = "x86_64"
@@ -3181,7 +3215,7 @@ class X8664(Architecture):
 
 		return disassembly, av_on_branch, av_access_type
 		
-	def disasm(self, address, buffer, pc):
+	def disasm(self, address, buffer, pc, lldb_result=None):
 		cs = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
 		cs.detail   = True
 
@@ -3202,8 +3236,10 @@ class X8664(Architecture):
 					msg = f"{RED}->{RST} {i.address:x}{RED} :\t{GRN}{i.mnemonic}{RST}\t{i.op_str}\t"
 
 				print(msg)
+				lldb_result.PutCString(msg)
 			else:
 				print(f"   {i.address:x}{RED} :\t{GRN}{i.mnemonic}{RST}\t{i.op_str}")
+				lldb_result.PutCString(f"   {i.address:x}{RED} :\t{GRN}{i.mnemonic}{RST}\t{i.op_str}")
 
 	def print_registers(self, frame):
 		print("$rax : 0x%016x   $rbx : 0x%016x   $rcx : 0x%016x   $rdx : 0x%016x"%(get_register("rax", frame),  get_register("rbx", frame),  get_register("rcx", frame),  get_register("rdx", frame)))
@@ -3437,13 +3473,19 @@ class ContextCommand(LLDBCommand):
 
 		if arch:
 			context_title("stack")
-			run_command("rstack")
+			self.result.PutCString("stack")
+
+			op, err = run_command_return_output("rstack")
+			print(op)
+
+			self.result.PutCString(op)
 
 			context_title("registers")
 			arch.print_registers(frame)
 
 			context_title("code")
-			arch.disasm(address, buffer, frame.pc)
+			arch.disasm(address, buffer, frame.pc, self.result)
+
 
 class RegisterReadCommand(LLDBCommand):
 	def name(self):
@@ -3623,11 +3665,11 @@ class DumpStackCommand(LLDBCommand):
 			cache['  '] = ('  ', ' ')
 
 			print(HEADER)
+			# self.result.PutCString(HEADER)
 			cur = 0
 			row = address
 			line = buffer[cur:cur+8]
 			
-
 			while line:
 				chain_display = ""
 				addr = struct.unpack("<Q", line)[0]
@@ -3648,12 +3690,14 @@ class DumpStackCommand(LLDBCommand):
 					printable += abyte if i != 14 else abyte 
 
 				print(LINE_FORMATTER.format(row, hexbytes, printable, chain_display))
-				
+				# self.result.PutCString(LINE_FORMATTER.format(row, hexbytes, printable, chain_display))
+
 				row += 0x10
 				cur += 0x10
 				line = buffer[cur:cur+8]
 			
 			print(FOOTER)
+			# self.result.PutCString(FOOTER)
 
 	
 class DisplayMemoryCommand(LLDBCommand):
@@ -3862,7 +3906,7 @@ class ExploitableCommand(LLDBCommand):
 		if arguments[0]:
 			tid 	= evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
 			thread 	= process.GetThreadByIndexID(tid)
-
+		
 		frame 	= thread.GetFrameAtIndex(0)
 		pc 		= frame.pc
 		arch 	= get_target_arch()
@@ -3870,17 +3914,14 @@ class ExploitableCommand(LLDBCommand):
 		if thread.GetStopReason() == lldb.eStopReasonException:
 			page_size = get_host_pagesize()
 			av_exception = thread.GetStopDescription(1024)
+			# print(av_exception)
 			exc, code, extra = parse_stopDescription(av_exception)
 
 			stack_suspicious = is_stack_suspicious(thread, exc, code, extra)
+			crash_code, crash_desc = arch.get_code_desc(exc, code)
 
 			if is_recursion:
 				code = int(code)
-				# exception 	= arch.exceptions[exc]
-				# crash_code 	= exception[code]['title']
-				# crash_desc	= exception[code]['desc']
-				crash_code, crash_desc = arch.get_code_desc(exc, code)
-
 				av_access_type	  	= "recursion"
 				av_is_exploitable 	= False
 				exploit_reason 		= f"The crash is suspected to be due to unbounded recursion since there were more than {MINIMUM_RECURSION_LENGTH} stack frames"
@@ -3890,19 +3931,12 @@ class ExploitableCommand(LLDBCommand):
 				exploit_reason 		= "The crash is suspected to be an exploitable issue due to the suspicious function in the stack trace of the crashing thread."
 				av_is_exploitable	= True
 				code = int(code)
-				# exception 	= arch.exceptions[exc]
-				# crash_code 	= exception[code]['title']
-				# crash_desc	= exception[code]['desc']
-				crash_code, crash_desc = arch.get_code_desc(exc, code)
+				
 				disassembly, _, _	= arch.get_disas_to_print(frame, process)
 
 			elif not is_recursion and exc == "EXC_BAD_ACCESS":
 				if code and extra:
 					code = int(code)
-					# exception 	= arch.exceptions[exc]
-					# crash_code 	= exception[code]['title']
-					# crash_desc	= exception[code]['desc']
-					crash_code, crash_desc = arch.get_code_desc(exc, code)
 
 					access_address = int(extra, 16)
 
@@ -3979,12 +4013,11 @@ class ExploitableCommand(LLDBCommand):
 				#     0x7fff2036a101 <+4>:  leaq   0x9c35(%rip), %rdi        ; "detected buffer overflow"
 				#     0x7fff2036a108 <+11>: callq  0x7fff2036abc3            ; _os_crash
 				# ->  0x7fff2036a10d <+16>: ud2
-				crash_code, crash_desc = arch.get_code_desc(exc, code)
+				
 				disassembly, _, _	= arch.get_disas_to_print(frame, process, pc)
 
-
 			elif exc == "EXC_ARITHMETIC":
-				crash_code, crash_desc = arch.get_code_desc(exc, code)
+				
 				exploit_reason 	= f"Arithmetic exception at {pc:016x}, probably not exploitable."
 				disassembly, _, av_access_type 	= arch.get_disas_to_print(frame, process)
 			
@@ -4007,10 +4040,121 @@ class ExploitableCommand(LLDBCommand):
 		print(f"av_type			: {MAG}{av_access_type}{RST}")
 		print(f"av_address		: {access_address:x}")
 		print(f"stack_suspicious	: {stack_suspicious}")
-		av_is_exploitable	=	f"{RED}True{RST}" if av_is_exploitable else f"{YEL}False{RST}"
-		print(f"av_is_exploitable 	: {av_is_exploitable}")
+		_av_is_exploitable	=	f"{RED}True{RST}" if av_is_exploitable else f"{YEL}False{RST}"
+		print(f"av_is_exploitable 	: {_av_is_exploitable}")
 		print(f"exploit_reason		: {exploit_reason}")
 		print(f"disassembly		: {disassembly}")
+
+		result = {}
+		result["crash_code"]	 =  f"{crash_code}"
+		result["crash_desc"]	 =  f"{crash_desc}"
+		result["av_on_branch"]	 =  f"{av_on_branch}"
+		result["av_null_deref"]	 =  f"{av_null_deref}"
+		result["av_badbeef"]	 =  f"{av_badbeef}"
+		result["is_recursion"]	 =  f"{is_recursion}"
+		result["av_type"]	 =  f"{av_access_type}"
+		result["av_address"]	 =  f"{access_address:x}"
+		result["stack_suspicious"]	 =  f"{stack_suspicious}"
+		_av_is_exploitable	=	"True" if av_is_exploitable else "False"
+		result["av_is_exploitable"]  =  f"{_av_is_exploitable}"
+		result["exploit_reason"]	 =  f"{exploit_reason}"
+		result["disassembly"]	 =  f"{disassembly}"
+		op, error = run_command_return_output("thread info")
+		bt, error = run_command_return_output("bt all")
+		result["thread_info"] = bt
+
+		# self.result.PutCString(json.dumps(result))
+
+	def crashthreadHash_(self, thread_info):
+		#pass in result of '(lldb)thread info' after crash
+		crash=thread_info
+		result  = re.search(",(.+?), queue =",crash)
+		result  = result.group(1)[1:]
+		address = result.split(' ')[0]
+		function = result.replace(address,'')
+
+		#remove offset
+		if function.find('+ ')!=-1:
+			function = function[:function.find('+ ')]
+
+		#check if there's a function name, else mostly its EIP overwrite 
+		if function=="":
+			return hashlib.md5(address).hexdigest()
+		else:
+			return hashlib.md5(function.encode()).hexdigest()
+
+	def proc_stats(self, stats):
+		try:
+			exit_reason = re.search("stop reason =(.+?)\)",stats).group()
+			
+			stats = re.search(",(.+?), stop reason =",stats)
+			stats = stats.group(1)[1:]
+			address = stats.split(' ')[0]
+			function = stats.replace(address,'')
+			# function=False
+
+			if function.find('+ ')!=-1:
+				function = function[:function.find('+ ')]
+			if 'queue =' in function:
+				function = False
+
+			EXC = exit_reason[exit_reason.find('stop reason =')+13:]
+			return (EXC[1:], function)
+		except:
+			try:
+				exit_reason = re.search("stop reason =.*",stats).group()
+				
+				stats = re.search(",(.+?), stop reason =",stats)
+				stats = stats.group(1)[1:]
+				address = stats.split(' ')[0]
+				function = stats.replace(address,'')
+
+				if function.find('+ ')!=-1:
+					function = function[:function.find('+ ')]
+				if 'queue =' in function:
+					function = False
+
+
+				EXC = exit_reason[exit_reason.find('stop reason =')+14:]
+				return (EXC[1:],function)
+				
+			except:
+				
+				return ('False','False')
+
+	#check functions in ['bt 3']
+	def returnAddress(self, line):
+		if "frame" in line:
+			return line.split(' ')[3]
+
+	def returnAddAndFunc(self, line):
+		addr_ = line.split(' ')[0]
+		func_ = line.replace(addr_,'')
+		return addr_,func_
+
+	def hashCalc(self, functions):
+		f=hashlib.md5()
+		for j in functions:
+			f.update(j)
+		return f.hexdigest()
+
+	def backtraceHash_(self, bt):
+		funcs=[]
+
+		bt=bt.replace(bt[bt.find("* thread"):bt.find("* frame #0:")],'')
+		for b in bt.split('\n'):
+			if b!='':
+				b_=re.search(": (.+?) \+ ",b)
+
+				try:
+					func_ = b_.group(1)
+					_, func_ = self.returnAddAndFunc(func_)
+					funcs.append(func_)
+				except:
+					funcs.append(self.returnAddress(b))
+				
+		hash_= self.hashCalc(funcs)
+		return hash_
 
 class InstructionManualCommand(LLDBCommand):
 	
@@ -4018,7 +4162,7 @@ class InstructionManualCommand(LLDBCommand):
 		return "man"
 	
 	def description(self):
-		return "Full Instruction Reference Plugin (idaref)"
+		return "Full Instruction Reference Plugin"
 	
 	def args(self):
 		return [
