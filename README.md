@@ -153,3 +153,4 @@ Apache License
 - [pixd](https://github.com/moreati/python-pixd)
 - [hexdump](https://github.com/sinofp/hexdoor)
 - [idaref](https://github.com/nologic/idaref)
+- [ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)

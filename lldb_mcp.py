@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+
+# Adapted from ida-pro-mcp (https://github.com/mrexodia/ida-pro-mcp)
+# Copyright (c) 2025 Duncan Ogilvie => MIT License
+
 import os
 import sys
 import ast
