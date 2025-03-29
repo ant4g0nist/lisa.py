@@ -5973,7 +5973,7 @@ def get_variables(
 def get_disassembly(
     address: Annotated[Optional[Union[int, str]], "Address to disassemble from (hex string or integer)"] = None,
     count: Annotated[int, "Number of instructions to disassemble"] = 10
-) -> List[DisassemblyLine]:
+) -> Dict[str, Any]:
     """Get disassembly around specified address or current PC."""
     try:
         global debugger
@@ -5985,70 +5985,93 @@ def get_disassembly(
         if not process.IsValid():
             raise JSONRPCError(LLDBError.PROCESS_NOT_ALIVE, "Process is not valid")
 
-        # Get the address to disassemble
-        addr_value = None
-        if address is None:
-            thread = process.GetSelectedThread()
-            if not thread.IsValid() or thread.GetNumFrames() == 0:
-                raise JSONRPCError(LLDBError.GENERIC, "No valid thread or frame")
+        # Build the disassembly command
+        cmd = "disassemble"
 
-            frame = thread.GetFrameAtIndex(0)
-            addr_value = frame.GetPC()
-        else:
-            # Convert address to integer if it's a string
-            if isinstance(address, str):
-                try:
-                    if address.lower().startswith("0x"):
-                        addr_value = int(address, 16)
-                    else:
-                        addr_value = int(address)
-                except ValueError:
-                    raise JSONRPCError(LLDBError.INVALID_ADDRESS, f"Invalid address format: {address}")
+        # Handle address specification
+        if address is not None:
+            # If it's a number or starts with 0x, use --start-address
+            if isinstance(address, int) or (isinstance(address, str) and address.lower().startswith("0x")):
+                # Make sure we format int properly
+                if isinstance(address, int):
+                    addr_str = f"0x{address:x}"
+                else:
+                    addr_str = address
+                cmd += f" --start-address {addr_str}"
             else:
-                addr_value = address
+                # Otherwise treat as a function name
+                cmd += f" -n {address}"
+        else:
+            # Use current PC if no address is specified
+            cmd += " --pc"
 
-        # Disassemble
-        instructions = target.ReadInstructions(lldb.SBAddress(addr_value, target), count)
-        if not instructions:
-            raise JSONRPCError(LLDBError.GENERIC, f"Failed to disassemble at address 0x{addr_value:x}")
+        # Add count if specified
+        if count > 0:
+            cmd += f" -c {count}"
 
-        # Format the output
-        current_pc = process.GetSelectedThread().GetFrameAtIndex(0).GetPC() if process.IsValid() and process.GetState() != lldb.eStateExited else None
-        disassembly = []
+        # Execute the command
+        result = lldb.SBCommandReturnObject()
+        debugger.GetCommandInterpreter().HandleCommand(cmd, result)
 
-        for instr in instructions:
-            addr = instr.GetAddress().GetLoadAddress(target)
-            mnemonic = instr.GetMnemonic(target) or ""
-            operands = instr.GetOperands(target) or ""
-            comment = instr.GetComment(target) or ""
-            instruction_bytes = []
+        if not result.Succeeded():
+            error_msg = result.GetError() or "Unknown disassembly error"
+            raise JSONRPCError(LLDBError.GENERIC, f"Disassembly failed: {error_msg}")
 
-            # Try to get instruction bytes if possible
+        output = result.GetOutput() or ""
+
+        # Parse the output into a structured format
+        lines = output.strip().split('\n')
+        parsed_lines = []
+        current_pc = None
+
+        try:
+            if process.IsValid() and process.GetState() == lldb.eStateStopped:
+                current_pc = process.GetSelectedThread().GetFrameAtIndex(0).pc
+        except:
+            current_pc = None
+
+        # Process the disassembly output
+        for line in lines:
+            if not line.strip() or '=>' in line and not ':' in line:  # Skip header lines without instruction
+                continue
+
             try:
-                # This gets the raw bytes of the instruction
-                error = lldb.SBError()
-                size = instr.GetByteSize()
-                if size > 0:
-                    bytes_buffer = process.ReadMemory(addr, size, error)
-                    if error.Success() and bytes_buffer:
-                        instruction_bytes = list(bytes_buffer)
+                # Example: "    0x100003f50 <+0>:  pushq  %rbp"
+                # or:      "->  0x100003f50 <+0>:  pushq  %rbp"
+                match = re.search(r'^(?:->)?\s*((0x[0-9a-fA-F]+)\s+(?:<[^>]+>)?)\s*:\s+(\S+)(?:\s+(.*))?$', line)
+                if match:
+                    addr_str = match.group(2)
+                    addr = int(addr_str, 16)
+                    context = match.group(1)
+                    instr = match.group(3)
+                    operands = match.group(4) or ""
+
+                    is_current = False
+                    if '=>' in line or '->' in line or (current_pc is not None and addr == current_pc):
+                        is_current = True
+
+                    parsed_lines.append({
+                        "address": addr,
+                        "instruction": instr,
+                        "operands": operands,
+                        "context": context,
+                        "is_current": is_current,
+                    })
             except:
-                pass  # Ignore errors getting bytes
+                # Skip lines that can't be parsed
+                continue
 
-            disassembly.append({
-                "address": addr,
-                "instruction": mnemonic,
-                "operands": operands,
-                "comment": comment,
-                "bytes": instruction_bytes,
-                "is_current": addr == current_pc
-            })
-
-        return disassembly
+        return {
+            "raw_output": output,
+            "instructions": parsed_lines,
+            "address_specified": str(address) if address is not None else "current_pc"
+        }
     except JSONRPCError:
         raise
     except Exception as e:
-        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+        error_msg = str(e) if e is not None else "Unknown error"
+        trace = traceback.format_exc()
+        raise JSONRPCError(LLDBError.GENERIC, error_msg, trace)
 
 @jsonrpc
 def read_memory(

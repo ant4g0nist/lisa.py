@@ -127,7 +127,7 @@ def get_variables(frame_id: Annotated[Optional[int], Field(description='ID of th
     return make_jsonrpc_request('get_variables', frame_id, thread_id)
 
 @mcp.tool()
-def get_disassembly(address: Annotated[Optional[Union[int, str]], Field(description='Address to disassemble from (hex string or integer)')]=None, count: Annotated[int, Field(description='Number of instructions to disassemble')]=10) -> List[DisassemblyLine]:
+def get_disassembly(address: Annotated[Optional[Union[int, str]], Field(description='Address to disassemble from (hex string or integer)')]=None, count: Annotated[int, Field(description='Number of instructions to disassemble')]=10) -> Dict[str, Any]:
     """Get disassembly around specified address or current PC."""
     return make_jsonrpc_request('get_disassembly', address, count)
 
