@@ -1,268 +1,148 @@
-# lisa.py
-	- An Exploit Dev Swiss Army Knife. 
-
-# Commands
-```
-  aslr      - View/modify ASLR setting of target.
-  checksec  - Display the security properties of the current executable
-  context   - Display context of given thread or selected thread by default. Usage: 'context all' or 'context 1'
-  csdis     - Disassemble buffer at a given pointer using Capstone
-  exploitable -- Check if the current exception context is exploitable
-  man       - Full Instruction Reference Plugin (idaref)
-  pbt       - Pretty print backtrace
-  pmem      - Visualize memory at a given address and size
-  pstack    - Visualize stack for a given frame or selected frame by default
-  rmem      - Hexdump memory at a given address and size
-  rr        - Display registers for a given thread and frame or selected thread and selected frame by default
-  rstack    - Hexdump stack for a given frame or selected frame by default
-  show_header -- Dump Mach-O headers
-  show_lc   - Dump Load Commands from Mach-O
-```
-
-# Commands in Detail
-## aslr
-- View/modify ASLR setting of target.
-```
-(lisa:>) help aslr 
-View/modify ASLR setting of target.  Expects 'raw' input (see 'help raw-input'.)
-
-Syntax: aslr
-View/modify ASLR setting of target.
-
-Arguments:
-  <on/off>; Enable/Disable ASLR. Usage: aslr on
-
-Syntax: aslr <on/off>
-
-This command is implemented as ASLRCommand
-```  
-<img src="resources/imgs/aslr.png" alt="aslr.png"/>
-
-## checksec
-- Display the security properties of the current executable
-```
-(lisa:>) help checksec 
-Display the security properties of the current executable  Expects 'raw' input (see 'help raw-input'.)
-
-Syntax: checksec
-Display the security properties of the current executable
-
-Arguments:
-  <macho>; Type: str; Path to mach-o binary. Usage: checksec /usr/bin/qlmanage
-
-Syntax: checksec <macho>
-
-This command is implemented as ChecksecCommand
-```
-<img src="resources/imgs/checksec.png" alt="checksec.png"/>
-
-## context
-- Display context of given thread or selected thread by default. Usage: 'context all' or 'context 1'
-```
-(lisa:>) help context 
-Display context of given thread or selected thread by default. Usage: 'context all' or 'context 1'  Expects 'raw' input (see 'help raw-input'.)
-
-Syntax: context
-Display context of given thread or selected thread by default. Usage: 'context all' or 'context 1'
-
-Arguments:
-  <thread>; Type: int; thread id or all.
-
-Syntax: context <thread>
-
-This command is implemented as ContextCommand
-```
-<img src="resources/imgs/context.png" alt="context.png"/>
-
-## csdis
-- Disassemble buffer at a given pointer using Capstone
-```
-(lisa:>) help csdis 
-Disassemble buffer at a given pointer using Capstone  Expects 'raw' input (see 'help raw-input'.)
-
-Syntax: csdis
-Disassemble buffer at a given pointer using Capstone
-
-Arguments:
-  <pointer>; Type: int; Pointer to buffer to disassemble
-  <length>; Type: int; length of buffer to disassemble
-
-Syntax: csdis <pointer> <length>
-
-This command is implemented as CapstoneDisassembleCommand
-```
-<img src="resources/imgs/csdis.png" alt="csdis.png"/>
-
-## exploitable
-- Check if the current exception context is exploitable
-```
-(lisa:>) help exploitable 
-Check if the current exception context is exploitable  Expects 'raw' input (see 'help raw-input'.)
-
-Syntax: exploitable
-Check if the current exception context is exploitable
+# LLDB MCP Integration
 
-Arguments:
-  <thread_id>; Type: int; ID of the exception thread. Uses selected thread by default
+This project provides a Model-Context Protocol (MCP) integration for LLDB, allowing AI assistants like Claude to interact with your debugging sessions through a standardized interface.
 
-Syntax: exploitable <thread_id>
+## Overview
 
-This command is implemented as ExploitableCommand
-```
-<img src="resources/imgs/exploitable.png" alt="exploitable.png"/>
+The integration consists of two main components:
 
-## man
-- Full Instruction Reference Plugin
-```
-(lisa:>) help man
-Full Instruction Reference Plugin  Expects 'raw' input (see 'help raw-input'.)
+1. **server.py** - An MCP server that communicates with Claude (or other MCP clients)
+2. **lldb_plugin.py** - A plugin that runs inside LLDB and exposes debugger functionality via JSON-RPC
 
-Syntax: man
-Full Instruction Reference Plugin
+This architecture allows Claude to help you debug code by directly interacting with LLDB through natural language. The MCP server acts as a bridge, translating Claude's requests into LLDB commands and returning results in a structured format.
 
-Arguments:
-  <instruction>; Type: str; instruction to search
-  <arch>; Type: str; Architecture of the instruction. By default, uses Arch of selected target.
+## Installation
 
-Syntax: man <instruction> <arch>
+### Prerequisites
 
-This command is implemented as InstructionManualCommand
-```
-<img src="resources/imgs/man.png" alt="man.png" width="800"/>
+- Python 3.10 or higher
+- LLDB with Python bindings
+- `fastmcp` Python package (for Claude Desktop integration)
 
-## pbt
-- Pretty print backtrace
-```
-(lisa:>) help pbt
-Pretty print backtrace  Expects 'raw' input (see 'help raw-input'.)
+### Setup
 
-Syntax: pbt
-Pretty print backtrace
+1. Clone this repository:
+   ```
+   git clone https://github.com/ant4g0nist/lldb-mcp.git
+   cd lldb-mcp
+   ```
 
-Syntax: pbt
+2. Install required dependencies:
+   ```
+   pip install "fastmcp>=1.2.0" httpx
+   ```
 
-This command is implemented as PrettyBacktraceCommand
-```
-<img src="resources/imgs/pbt.png" alt="pbt.png"/>
+   or
 
-## pmem
-- Visualize memory at a given address and size
-```
-(lisa:>) help pmem
-Visualize memory at a given address and size  Expects 'raw' input (see 'help raw-input'.)
+   ```
+   uv install "fastmcp>=1.2.0" httpx
+   ```
 
-Syntax: pmem
-Visualize memory at a given address and size
+## Usage
 
-Arguments:
-  <address>; Type: int; start of memory to display
-  <size>; Type: int; size of memory to display
+### Method 1: Using with Claude for Desktop
 
-Syntax: pmem <address> <size>
+1. Make sure Claude for Desktop is installed and updated to the latest version.
 
-This command is implemented as DisplayMemoryCommand
-```
-  <img src="resources/imgs/pmem.png" alt="pmem.png" width="800"/>
-  
-## pstack
-- Visualize stack for a given frame or selected frame by default
-```
-(lisa:>) help pstack
-Visualize stack for a given frame or selected frame by default  Expects 'raw' input (see 'help raw-input'.)
+2. Configure Claude for Desktop to use the LLDB MCP server by editing:
+   - path: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-Syntax: pstack
-Visualize stack for a given frame or selected frame by default
+3. Update the paths and add the LLDB MCP configuration:
+   ```json
+   {
+     "mcpServers": {
+       "lldb": {
+         "command": "/path/to/your/.local/bin/uv",
+         "args": [
+           "--directory",
+           "/path/to/your/lldb-mcp/llmcp",
+           "run",
+           "lldb_mcp.py"
+         ]
+       }
+     }
+   }
+   ```
 
-Arguments:
-  <size>; Type: int; stack size to display
-  <frame>; Type: int; frame id
-  <thread>; Type: int; thread id
+4. Restart Claude for Desktop.
 
-Syntax: pstack <size> <frame> <thread>
+5. Start a debugging session in LLDB and enable the MCP server with:
+   ```
+   (lldb) command script import lisa.py
+   ```
 
-This command is implemented as DisplayStackCommand
-```
-<img src="resources/imgs/pstack.png" alt="pstack.png" width="800"/>
+6. You should now see the LLDB tools available in Claude for Desktop. Look for the hammer icon.
 
-## rmem
-- Hexdump memory at a given address and size
-```
-(lisa:>) help rmem
-Hexdump memory at a given address and size  Expects 'raw' input (see 'help raw-input'.)
+### Method 2: Direct LLDB Integration
 
-Syntax: rmem
-Hexdump memory at a given address and size
+If you prefer to use the plugin directly from LLDB without Claude for Desktop:
 
-Arguments:
-  <address>; Type: int; start of memory to display
-  <size>; Type: int; size of memory to display
+1. Add the following to your `~/.lldbinit` file to load the plugin automatically:
+   ```
+   command script import /path/to/lldb_plugin.py
+   ```
 
-Syntax: rmem <address> <size>
+2. In your LLDB session, start the MCP server:
+   ```
+   (lldb) mcp start
+   ```
 
-This command is implemented as ReadMemoryCommand
-```
-<img src="resources/imgs/rmem.png" alt="rmem.png"/>
+3. The server will be available at http://localhost:13338 for any MCP client to connect to.
 
-## rstack
-- Hexdump stack for a given frame or selected frame by default
-```
-(lisa:>) help rstack
-Hexdump stack for a given frame or selected frame by default  Expects 'raw' input (see 'help raw-input'.)
+## Available LLDB Tools
 
-Syntax: rstack
-Hexdump stack for a given frame or selected frame by default
+The MCP server exposes the following methods for AI assistants:
 
-Arguments:
-  <size>; Type: int; stack size to display
-  <frame>; Type: int; frame id
-  <thread>; Type: int; thread id
-
-Syntax: rstack <size> <frame> <thread>
-
-This command is implemented as DumpStackCommand
-```
-<img src="resources/imgs/rstack.png" alt="rstack.png"/>
-
-## show_header
-- Dump Mach-O headers
-```
-(lisa:>) help show_header
-Dump Mach-O headers  Expects 'raw' input (see 'help raw-input'.)
-
-Syntax: show_header
-Dump Mach-O headers
-
-Arguments:
-  <macho>; Type: str; Path to mach-o binary. Usage: show_header /usr/bin/qlmanage or macho
-
-Syntax: show_header <macho>
-
-This command is implemented as DisplayMachoHeaderCommand
-```
-<img src="resources/imgs/show_header.png" alt="show_header.png"/>
-
-## show_lc
-- Dump Load Commands from Mach-O
-```
-(lisa:>) help show_lc
-Dump Load Commands from Mach-O  Expects 'raw' input (see 'help raw-input'.)
-
-Syntax: show_lc
-Dump Load Commands from Mach-O
-
-Arguments:
-  <macho>; Type: str; Path to mach-o binary. Usage: show_lc /usr/bin/qlmanage or macho
-
-Syntax: show_lc <macho>
-
-This command is implemented as DisplayMachoLoadCmdCommand
-```
-<img src="resources/imgs/show_lc.png" alt="show_lc.png"/>
-
+- **create_target** - Create a debug target from an executable path
+- **launch_process** - Launch a process with optional arguments, environment variables, and working directory
+- **attach_to_process** - Attach to a running process by PID
+- **detach_from_process** - Detach from the current process
+- **continue_process** - Continue process execution
+- **step_over** - Step over current line or instruction
+- **step_into** - Step into function call
+- **step_out** - Step out of current function
+- **set_breakpoint** - Set a breakpoint at a specified location
+- **delete_breakpoint** - Delete a breakpoint by ID
+- **list_breakpoints** - List all breakpoints
+- **get_backtrace** - Get backtrace for current thread or specified thread
+- **get_variables** - Get variables in current frame
+- **get_disassembly** - Get disassembly around specified address or current PC
+- **read_memory** - Read memory from a specific address
+- **get_metadata** - Get metadata about the current debugging session
+- **run_lldb_command** - Execute an arbitrary LLDB command
+- **evaluate_expression** - Evaluate expression in current context
+
+## Example Interactions with Claude
+
+Once set up, you can interact with LLDB through Claude using natural language. Some examples:
+
+- "Debug this program at `/path/to/executable`"
+- "Set a breakpoint at main"
+- "Run the program with arguments `-v input.txt`"
+- "Show me the variables in the current frame"
+- "Step into the next function call"
+- "What's the backtrace right now?"
+- "Evaluate the expression `ptr->data[i]`"
+- "Show me the assembly code at the current instruction"
+
+## Troubleshooting
+
+- **Plugin not loading**: Ensure LLDB's Python environment can access the necessary modules
+- **Server connection issues**: Check if port 13338 is already in use by another application
+- **Claude not detecting tools**: Verify the correct configuration in `claude_desktop_config.json`
+- **Command errors**: The plugin logs errors to the LLDB console, check there for details
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit pull requests or create issues for bugs and feature requests.
+
+## License
+
+Apache License
 
 ## TODO
-- [ ] Update instruction manual
-- [ ] Add more ARM64 testcases to test exploitable command
+- [ ] Update instruction manuals
+- [ ] Add more testcases
 
 ### Credits
 

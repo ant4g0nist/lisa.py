@@ -21,8 +21,11 @@ import capstone
 import optparse
 import platform
 import functools
+import traceback
+import threading
 import subprocess
-
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from typing import Annotated, TypedDict, List, Dict, Any, Optional, Union
 BLK = "\033[30m"
 BLU = "\033[34m"
 CYN = "\033[36m"
@@ -37,6 +40,7 @@ VERTICAL_LINE = "\u2502"
 HORIZONTAL_LINE = "\u2500"
 
 __prompt__ = f"'(lisa:>) '"
+debugger = None
 
 # from CW
 MINIMUM_RECURSION_LENGTH = 300
@@ -105,7 +109,7 @@ def get_host_arch():
 def cpu_to_string(cpu):
 	if cpu == CPU_TYPE_X86_64:
 		return "x86_64"
-	
+
 	elif cpu == CPU_TYPE_ARM64:
 		return "arm64"
 
@@ -120,6 +124,1058 @@ def get_target_arch():
 		return X8664()
 	else:
 		errlog(f"Architecture {arch} not supported")
+
+
+def is_exe(fpath):
+    """Returns True if fpath is an executable."""
+    return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
+
+
+def which(program):
+    """Returns the full path to a program; None otherwise."""
+    fpath, fname = os.path.split(program)
+    if fpath:
+        if is_exe(program):
+            return program
+    else:
+        for path in os.environ["PATH"].split(os.pathsep):
+            exe_file = os.path.join(path, program)
+            if is_exe(exe_file):
+                return exe_file
+    return None
+
+
+# ===================================================
+# Disassembly for an SBFunction or an SBSymbol object
+# ===================================================
+
+
+def disassemble(target, function_or_symbol):
+    """Disassemble the function or symbol given a target.
+
+    It returns the disassembly content in a string object.
+    """
+    buf = io.StringIO()
+    insts = function_or_symbol.GetInstructions(target)
+    for i in insts:
+        print(i, file=buf)
+    return buf.getvalue()
+
+
+# ==========================================================
+# Integer (byte size 1, 2, 4, and 8) to bytearray conversion
+# ==========================================================
+
+
+def int_to_bytearray(val, bytesize):
+    """Utility function to convert an integer into a bytearray.
+
+    It returns the bytearray in the little endian format.  It is easy to get the
+    big endian format, just do ba.reverse() on the returned object.
+    """
+    import struct
+
+    if bytesize == 1:
+        return bytearray([val])
+
+    # Little endian followed by a format character.
+    template = "<%c"
+    if bytesize == 2:
+        fmt = template % "h"
+    elif bytesize == 4:
+        fmt = template % "i"
+    elif bytesize == 4:
+        fmt = template % "q"
+    else:
+        return None
+
+    packed = struct.pack(fmt, val)
+    return bytearray(ord(x) for x in packed)
+
+
+def bytearray_to_int(bytes, bytesize):
+    """Utility function to convert a bytearray into an integer.
+
+    It interprets the bytearray in the little endian format. For a big endian
+    bytearray, just do ba.reverse() on the object before passing it in.
+    """
+    import struct
+
+    if bytesize == 1:
+        return bytes[0]
+
+    # Little endian followed by a format character.
+    template = "<%c"
+    if bytesize == 2:
+        fmt = template % "h"
+    elif bytesize == 4:
+        fmt = template % "i"
+    elif bytesize == 4:
+        fmt = template % "q"
+    else:
+        return None
+
+    unpacked = struct.unpack(fmt, str(bytes))
+    return unpacked[0]
+
+
+# ==============================================================
+# Get the description of an lldb object or None if not available
+# ==============================================================
+def get_description(obj, option=None):
+    """Calls lldb_obj.GetDescription() and returns a string, or None.
+
+    For SBTarget, SBBreakpointLocation, and SBWatchpoint lldb objects, an extra
+    option can be passed in to describe the detailed level of description
+    desired:
+        o lldb.eDescriptionLevelBrief
+        o lldb.eDescriptionLevelFull
+        o lldb.eDescriptionLevelVerbose
+    """
+    method = getattr(obj, "GetDescription")
+    if not method:
+        return None
+    tuple = (lldb.SBTarget, lldb.SBBreakpointLocation, lldb.SBWatchpoint)
+    if isinstance(obj, tuple):
+        if option is None:
+            option = lldb.eDescriptionLevelBrief
+
+    stream = lldb.SBStream()
+    if option is None:
+        success = method(stream)
+    else:
+        success = method(stream, option)
+    if not success:
+        return None
+    return stream.GetData()
+
+
+# =================================================
+# Convert some enum value to its string counterpart
+# =================================================
+
+
+def state_type_to_str(enum):
+    """Returns the stateType string given an enum."""
+    if enum == lldb.eStateInvalid:
+        return "invalid"
+    elif enum == lldb.eStateUnloaded:
+        return "unloaded"
+    elif enum == lldb.eStateConnected:
+        return "connected"
+    elif enum == lldb.eStateAttaching:
+        return "attaching"
+    elif enum == lldb.eStateLaunching:
+        return "launching"
+    elif enum == lldb.eStateStopped:
+        return "stopped"
+    elif enum == lldb.eStateRunning:
+        return "running"
+    elif enum == lldb.eStateStepping:
+        return "stepping"
+    elif enum == lldb.eStateCrashed:
+        return "crashed"
+    elif enum == lldb.eStateDetached:
+        return "detached"
+    elif enum == lldb.eStateExited:
+        return "exited"
+    elif enum == lldb.eStateSuspended:
+        return "suspended"
+    else:
+        raise Exception("Unknown StateType enum")
+
+
+def stop_reason_to_str(enum):
+    """Returns the stopReason string given an enum."""
+    if enum == lldb.eStopReasonInvalid:
+        return "invalid"
+    elif enum == lldb.eStopReasonNone:
+        return "none"
+    elif enum == lldb.eStopReasonTrace:
+        return "trace"
+    elif enum == lldb.eStopReasonBreakpoint:
+        return "breakpoint"
+    elif enum == lldb.eStopReasonWatchpoint:
+        return "watchpoint"
+    elif enum == lldb.eStopReasonSignal:
+        return "signal"
+    elif enum == lldb.eStopReasonException:
+        return "exception"
+    elif enum == lldb.eStopReasonPlanComplete:
+        return "plancomplete"
+    elif enum == lldb.eStopReasonThreadExiting:
+        return "threadexiting"
+    else:
+        raise Exception("Unknown StopReason enum")
+
+
+def symbol_type_to_str(enum):
+    """Returns the symbolType string given an enum."""
+    if enum == lldb.eSymbolTypeInvalid:
+        return "invalid"
+    elif enum == lldb.eSymbolTypeAbsolute:
+        return "absolute"
+    elif enum == lldb.eSymbolTypeCode:
+        return "code"
+    elif enum == lldb.eSymbolTypeData:
+        return "data"
+    elif enum == lldb.eSymbolTypeTrampoline:
+        return "trampoline"
+    elif enum == lldb.eSymbolTypeRuntime:
+        return "runtime"
+    elif enum == lldb.eSymbolTypeException:
+        return "exception"
+    elif enum == lldb.eSymbolTypeSourceFile:
+        return "sourcefile"
+    elif enum == lldb.eSymbolTypeHeaderFile:
+        return "headerfile"
+    elif enum == lldb.eSymbolTypeObjectFile:
+        return "objectfile"
+    elif enum == lldb.eSymbolTypeCommonBlock:
+        return "commonblock"
+    elif enum == lldb.eSymbolTypeBlock:
+        return "block"
+    elif enum == lldb.eSymbolTypeLocal:
+        return "local"
+    elif enum == lldb.eSymbolTypeParam:
+        return "param"
+    elif enum == lldb.eSymbolTypeVariable:
+        return "variable"
+    elif enum == lldb.eSymbolTypeVariableType:
+        return "variabletype"
+    elif enum == lldb.eSymbolTypeLineEntry:
+        return "lineentry"
+    elif enum == lldb.eSymbolTypeLineHeader:
+        return "lineheader"
+    elif enum == lldb.eSymbolTypeScopeBegin:
+        return "scopebegin"
+    elif enum == lldb.eSymbolTypeScopeEnd:
+        return "scopeend"
+    elif enum == lldb.eSymbolTypeAdditional:
+        return "additional"
+    elif enum == lldb.eSymbolTypeCompiler:
+        return "compiler"
+    elif enum == lldb.eSymbolTypeInstrumentation:
+        return "instrumentation"
+    elif enum == lldb.eSymbolTypeUndefined:
+        return "undefined"
+
+
+def value_type_to_str(enum):
+    """Returns the valueType string given an enum."""
+    if enum == lldb.eValueTypeInvalid:
+        return "invalid"
+    elif enum == lldb.eValueTypeVariableGlobal:
+        return "global_variable"
+    elif enum == lldb.eValueTypeVariableStatic:
+        return "static_variable"
+    elif enum == lldb.eValueTypeVariableArgument:
+        return "argument_variable"
+    elif enum == lldb.eValueTypeVariableLocal:
+        return "local_variable"
+    elif enum == lldb.eValueTypeRegister:
+        return "register"
+    elif enum == lldb.eValueTypeRegisterSet:
+        return "register_set"
+    elif enum == lldb.eValueTypeConstResult:
+        return "constant_result"
+    else:
+        raise Exception("Unknown ValueType enum")
+
+
+# ==================================================
+# Get stopped threads due to each stop reason.
+# ==================================================
+
+
+def sort_stopped_threads(
+    process,
+    breakpoint_threads=None,
+    crashed_threads=None,
+    watchpoint_threads=None,
+    signal_threads=None,
+    exiting_threads=None,
+    other_threads=None,
+):
+    """Fills array *_threads with threads stopped for the corresponding stop
+    reason.
+    """
+    for lst in [
+        breakpoint_threads,
+        watchpoint_threads,
+        signal_threads,
+        exiting_threads,
+        other_threads,
+    ]:
+        if lst is not None:
+            lst[:] = []
+
+    for thread in process:
+        dispatched = False
+        for reason, list in [
+            (lldb.eStopReasonBreakpoint, breakpoint_threads),
+            (lldb.eStopReasonException, crashed_threads),
+            (lldb.eStopReasonWatchpoint, watchpoint_threads),
+            (lldb.eStopReasonSignal, signal_threads),
+            (lldb.eStopReasonThreadExiting, exiting_threads),
+            (None, other_threads),
+        ]:
+            if not dispatched and list is not None:
+                if thread.GetStopReason() == reason or reason is None:
+                    list.append(thread)
+                    dispatched = True
+
+
+# ==================================================
+# Utility functions for setting breakpoints
+# ==================================================
+
+
+def run_break_set_by_file_and_line(
+    test,
+    file_name,
+    line_number,
+    extra_options=None,
+    num_expected_locations=1,
+    loc_exact=False,
+    module_name=None,
+):
+    """Set a breakpoint by file and line, returning the breakpoint number.
+
+    If extra_options is not None, then we append it to the breakpoint set command.
+
+    If num_expected_locations is -1 we check that we got AT LEAST one location, otherwise we check that num_expected_locations equals the number of locations.
+
+    If loc_exact is true, we check that there is one location, and that location must be at the input file and line number.
+    """
+
+    if file_name is None:
+        command = "breakpoint set -l %d" % (line_number)
+    else:
+        command = 'breakpoint set -f "%s" -l %d' % (file_name, line_number)
+
+    if module_name:
+        command += " --shlib '%s'" % (module_name)
+
+    if extra_options:
+        command += " " + extra_options
+
+    break_results = run_break_set_command(test, command)
+
+    if num_expected_locations == 1 and loc_exact:
+        check_breakpoint_result(
+            test,
+            break_results,
+            num_locations=num_expected_locations,
+            file_name=file_name,
+            line_number=line_number,
+            module_name=module_name,
+        )
+    else:
+        check_breakpoint_result(
+            test, break_results, num_locations=num_expected_locations
+        )
+
+    return get_bpno_from_match(break_results)
+
+
+def run_break_set_by_symbol(
+    test,
+    symbol,
+    extra_options=None,
+    num_expected_locations=-1,
+    sym_exact=False,
+    module_name=None,
+):
+    """Set a breakpoint by symbol name.  Common options are the same as run_break_set_by_file_and_line.
+
+    If sym_exact is true, then the output symbol must match the input exactly, otherwise we do a substring match.
+    """
+    command = 'breakpoint set -n "%s"' % (symbol)
+
+    if module_name:
+        command += " --shlib '%s'" % (module_name)
+
+    if extra_options:
+        command += " " + extra_options
+
+    break_results = run_break_set_command(test, command)
+
+    if num_expected_locations == 1 and sym_exact:
+        check_breakpoint_result(
+            test,
+            break_results,
+            num_locations=num_expected_locations,
+            symbol_name=symbol,
+            module_name=module_name,
+        )
+    else:
+        check_breakpoint_result(
+            test, break_results, num_locations=num_expected_locations
+        )
+
+    return get_bpno_from_match(break_results)
+
+
+def run_break_set_by_selector(
+    test, selector, extra_options=None, num_expected_locations=-1, module_name=None
+):
+    """Set a breakpoint by selector.  Common options are the same as run_break_set_by_file_and_line."""
+
+    command = 'breakpoint set -S "%s"' % (selector)
+
+    if module_name:
+        command += ' --shlib "%s"' % (module_name)
+
+    if extra_options:
+        command += " " + extra_options
+
+    break_results = run_break_set_command(test, command)
+
+    if num_expected_locations == 1:
+        check_breakpoint_result(
+            test,
+            break_results,
+            num_locations=num_expected_locations,
+            symbol_name=selector,
+            symbol_match_exact=False,
+            module_name=module_name,
+        )
+    else:
+        check_breakpoint_result(
+            test, break_results, num_locations=num_expected_locations
+        )
+
+    return get_bpno_from_match(break_results)
+
+
+def run_break_set_by_regexp(
+    test, regexp, extra_options=None, num_expected_locations=-1
+):
+    """Set a breakpoint by regular expression match on symbol name.  Common options are the same as run_break_set_by_file_and_line."""
+
+    command = 'breakpoint set -r "%s"' % (regexp)
+    if extra_options:
+        command += " " + extra_options
+
+    break_results = run_break_set_command(test, command)
+
+    check_breakpoint_result(test, break_results, num_locations=num_expected_locations)
+
+    return get_bpno_from_match(break_results)
+
+
+def run_break_set_by_source_regexp(
+    test, regexp, extra_options=None, num_expected_locations=-1
+):
+    """Set a breakpoint by source regular expression.  Common options are the same as run_break_set_by_file_and_line."""
+    command = 'breakpoint set -p "%s"' % (regexp)
+    if extra_options:
+        command += " " + extra_options
+
+    break_results = run_break_set_command(test, command)
+
+    check_breakpoint_result(test, break_results, num_locations=num_expected_locations)
+
+    return get_bpno_from_match(break_results)
+
+
+def run_break_set_command(test, command):
+    """Run the command passed in - it must be some break set variant - and analyze the result.
+    Returns a dictionary of information gleaned from the command-line results.
+    Will assert if the breakpoint setting fails altogether.
+
+    Dictionary will contain:
+        bpno          - breakpoint of the newly created breakpoint, -1 on error.
+        num_locations - number of locations set for the breakpoint.
+
+    If there is only one location, the dictionary MAY contain:
+        file          - source file name
+        line_no       - source line number
+        symbol        - symbol name
+        inline_symbol - inlined symbol name
+        offset        - offset from the original symbol
+        module        - module
+        address       - address at which the breakpoint was set."""
+
+    patterns = [
+        r"^Breakpoint (?P<bpno>[0-9]+): (?P<num_locations>[0-9]+) locations\.$",
+        r"^Breakpoint (?P<bpno>[0-9]+): (?P<num_locations>no) locations \(pending\)\.",
+        r"^Breakpoint (?P<bpno>[0-9]+): where = (?P<module>.*)`(?P<symbol>[+\-]{0,1}[^+]+)( \+ (?P<offset>[0-9]+)){0,1}( \[inlined\] (?P<inline_symbol>.*)){0,1} at (?P<file>[^:]+):(?P<line_no>[0-9]+), address = (?P<address>0x[0-9a-fA-F]+)$",
+        r"^Breakpoint (?P<bpno>[0-9]+): where = (?P<module>.*)`(?P<symbol>.*)( \+ (?P<offset>[0-9]+)){0,1}, address = (?P<address>0x[0-9a-fA-F]+)$",
+    ]
+    match_object = test.match(command, patterns)
+    break_results = match_object.groupdict()
+
+    # We always insert the breakpoint number, setting it to -1 if we couldn't find it
+    # Also, make sure it gets stored as an integer.
+    if not "bpno" in break_results:
+        break_results["bpno"] = -1
+    else:
+        break_results["bpno"] = int(break_results["bpno"])
+
+    # We always insert the number of locations
+    # If ONE location is set for the breakpoint, then the output doesn't mention locations, but it has to be 1...
+    # We also make sure it is an integer.
+
+    if not "num_locations" in break_results:
+        num_locations = 1
+    else:
+        num_locations = break_results["num_locations"]
+        if num_locations == "no":
+            num_locations = 0
+        else:
+            num_locations = int(break_results["num_locations"])
+
+    break_results["num_locations"] = num_locations
+
+    if "line_no" in break_results:
+        break_results["line_no"] = int(break_results["line_no"])
+
+    return break_results
+
+
+def get_bpno_from_match(break_results):
+    return int(break_results["bpno"])
+
+
+def check_breakpoint_result(
+    test,
+    break_results,
+    file_name=None,
+    line_number=-1,
+    symbol_name=None,
+    symbol_match_exact=True,
+    module_name=None,
+    offset=-1,
+    num_locations=-1,
+):
+    out_num_locations = break_results["num_locations"]
+
+    if num_locations == -1:
+        test.assertTrue(
+            out_num_locations > 0, "Expecting one or more locations, got none."
+        )
+    else:
+        test.assertTrue(
+            num_locations == out_num_locations,
+            "Expecting %d locations, got %d." % (num_locations, out_num_locations),
+        )
+
+    if file_name:
+        out_file_name = ""
+        if "file" in break_results:
+            out_file_name = break_results["file"]
+        test.assertTrue(
+            file_name == out_file_name,
+            "Breakpoint file name '%s' doesn't match resultant name '%s'."
+            % (file_name, out_file_name),
+        )
+
+    if line_number != -1:
+        out_file_line = -1
+        if "line_no" in break_results:
+            out_line_number = break_results["line_no"]
+
+        test.assertTrue(
+            line_number == out_line_number,
+            "Breakpoint line number %s doesn't match resultant line %s."
+            % (line_number, out_line_number),
+        )
+
+    if symbol_name:
+        out_symbol_name = ""
+        # Look first for the inlined symbol name, otherwise use the symbol
+        # name:
+        if "inline_symbol" in break_results and break_results["inline_symbol"]:
+            out_symbol_name = break_results["inline_symbol"]
+        elif "symbol" in break_results:
+            out_symbol_name = break_results["symbol"]
+
+        if symbol_match_exact:
+            test.assertTrue(
+                symbol_name == out_symbol_name,
+                "Symbol name '%s' doesn't match resultant symbol '%s'."
+                % (symbol_name, out_symbol_name),
+            )
+        else:
+            test.assertTrue(
+                out_symbol_name.find(symbol_name) != -1,
+                "Symbol name '%s' isn't in resultant symbol '%s'."
+                % (symbol_name, out_symbol_name),
+            )
+
+    if module_name:
+        out_nodule_name = None
+        if "module" in break_results:
+            out_module_name = break_results["module"]
+
+        test.assertTrue(
+            module_name.find(out_module_name) != -1,
+            "Symbol module name '%s' isn't in expected module name '%s'."
+            % (out_module_name, module_name),
+        )
+
+
+# ==================================================
+# Utility functions related to Threads and Processes
+# ==================================================
+
+
+def get_stopped_threads(process, reason):
+    """Returns the thread(s) with the specified stop reason in a list.
+
+    The list can be empty if no such thread exists.
+    """
+    threads = []
+    for t in process:
+        if t.GetStopReason() == reason:
+            threads.append(t)
+    return threads
+
+
+def get_stopped_thread(process, reason):
+    """A convenience function which returns the first thread with the given stop
+    reason or None.
+
+    Example usages:
+
+    1. Get the stopped thread due to a breakpoint condition
+
+    ...
+        from lldbutil import get_stopped_thread
+        thread = get_stopped_thread(process, lldb.eStopReasonPlanComplete)
+        self.assertTrue(thread.IsValid(), "There should be a thread stopped due to breakpoint condition")
+    ...
+
+    2. Get the thread stopped due to a breakpoint
+
+    ...
+        from lldbutil import get_stopped_thread
+        thread = get_stopped_thread(process, lldb.eStopReasonBreakpoint)
+        self.assertTrue(thread.IsValid(), "There should be a thread stopped due to breakpoint")
+    ...
+
+    """
+    threads = get_stopped_threads(process, reason)
+    if len(threads) == 0:
+        return None
+    return threads[0]
+
+
+def get_threads_stopped_at_breakpoint(process, bkpt):
+    """For a stopped process returns the thread stopped at the breakpoint passed in bkpt"""
+    stopped_threads = []
+    threads = []
+
+    stopped_threads = get_stopped_threads(process, lldb.eStopReasonBreakpoint)
+
+    if len(stopped_threads) == 0:
+        return threads
+
+    for thread in stopped_threads:
+        # Make sure we've hit our breakpoint...
+        break_id = thread.GetStopReasonDataAtIndex(0)
+        if break_id == bkpt.GetID():
+            threads.append(thread)
+
+    return threads
+
+
+def continue_to_breakpoint(process, bkpt):
+    """Continues the process, if it stops, returns the threads stopped at bkpt; otherwise, returns None"""
+    process.Continue()
+    if process.GetState() != lldb.eStateStopped:
+        return None
+    else:
+        return get_threads_stopped_at_breakpoint(process, bkpt)
+
+
+def get_caller_symbol(thread):
+    """
+    Returns the symbol name for the call site of the leaf function.
+    """
+    depth = thread.GetNumFrames()
+    if depth <= 1:
+        return None
+    caller = thread.GetFrameAtIndex(1).GetSymbol()
+    if caller:
+        return caller.GetName()
+    else:
+        return None
+
+
+def get_function_names(thread):
+    """
+    Returns a sequence of function names from the stack frames of this thread.
+    """
+
+    def GetFuncName(i):
+        return thread.GetFrameAtIndex(i).GetFunctionName()
+
+    return [GetFuncName(i) for i in range(thread.GetNumFrames())]
+
+
+def get_symbol_names(thread):
+    """
+    Returns a sequence of symbols for this thread.
+    """
+
+    def GetSymbol(i):
+        return thread.GetFrameAtIndex(i).GetSymbol().GetName()
+
+    return [GetSymbol(i) for i in range(thread.GetNumFrames())]
+
+
+# def get_pc_addresses(thread):
+#     """
+#     Returns a sequence of pc addresses for this thread.
+#     """
+
+#     def GetPCAddress(i):
+#         return thread.GetFrameAtIndex(i).GetPCAddress()
+
+#     return [GetPCAddress(i) for i in range(thread.GetNumFrames())]
+
+
+def get_filenames(thread):
+    """
+    Returns a sequence of file names from the stack frames of this thread.
+    """
+
+    def GetFilename(i):
+        return thread.GetFrameAtIndex(i).GetLineEntry().GetFileSpec().GetFilename()
+
+    return [GetFilename(i) for i in range(thread.GetNumFrames())]
+
+
+def get_line_numbers(thread):
+    """
+    Returns a sequence of line numbers from the stack frames of this thread.
+    """
+
+    def GetLineNumber(i):
+        return thread.GetFrameAtIndex(i).GetLineEntry().GetLine()
+
+    return [GetLineNumber(i) for i in range(thread.GetNumFrames())]
+
+
+def get_module_names(thread):
+    """
+    Returns a sequence of module names from the stack frames of this thread.
+    """
+
+    def GetModuleName(i):
+        return thread.GetFrameAtIndex(i).GetModule().GetFileSpec().GetFilename()
+
+    return [GetModuleName(i) for i in range(thread.GetNumFrames())]
+
+
+def get_stack_frames(thread):
+    """
+    Returns a sequence of stack frames for this thread.
+    """
+
+    def GetStackFrame(i):
+        return thread.GetFrameAtIndex(i)
+
+    return [GetStackFrame(i) for i in range(thread.GetNumFrames())]
+
+
+def print_stacktrace(thread, string_buffer=False):
+    """Prints a simple stack trace of this thread."""
+
+    output = io.StringIO() if string_buffer else sys.stdout
+    target = thread.GetProcess().GetTarget()
+
+    depth = thread.GetNumFrames()
+
+    mods = get_module_names(thread)
+    funcs = get_function_names(thread)
+    symbols = get_symbol_names(thread)
+    files = get_filenames(thread)
+    lines = get_line_numbers(thread)
+    addrs = get_pc_addresses(thread)
+
+    if thread.GetStopReason() != lldb.eStopReasonInvalid:
+        desc = "stop reason=" + stop_reason_to_str(thread.GetStopReason())
+    else:
+        desc = ""
+    print(
+        "Stack trace for thread id={0:#x} name={1} queue={2} ".format(
+            thread.GetThreadID(), thread.GetName(), thread.GetQueueName()
+        )
+        + desc,
+        file=output,
+    )
+
+    for i in range(depth):
+        frame = thread.GetFrameAtIndex(i)
+        function = frame.GetFunction()
+
+        load_addr = addrs[i].GetLoadAddress(target)
+        if not function:
+            file_addr = addrs[i].GetFileAddress()
+            start_addr = frame.GetSymbol().GetStartAddress().GetFileAddress()
+            symbol_offset = file_addr - start_addr
+            print(
+                "  frame #{num}: {addr:#016x} {mod}`{symbol} + {offset}".format(
+                    num=i,
+                    addr=load_addr,
+                    mod=mods[i],
+                    symbol=symbols[i],
+                    offset=symbol_offset,
+                ),
+                file=output,
+            )
+        else:
+            print(
+                "  frame #{num}: {addr:#016x} {mod}`{func} at {file}:{line} {args}".format(
+                    num=i,
+                    addr=load_addr,
+                    mod=mods[i],
+                    func="%s [inlined]" % funcs[i] if frame.IsInlined() else funcs[i],
+                    file=files[i],
+                    line=lines[i],
+                    args=get_args_as_string(frame, showFuncName=False)
+                    if not frame.IsInlined()
+                    else "()",
+                ),
+                file=output,
+            )
+
+    if string_buffer:
+        return output.getvalue()
+
+
+def print_stacktraces(process, string_buffer=False):
+    """Prints the stack traces of all the threads."""
+
+    output = io.StringIO() if string_buffer else sys.stdout
+
+    print("Stack traces for " + str(process), file=output)
+
+    for thread in process:
+        print(print_stacktrace(thread, string_buffer=True), file=output)
+
+    if string_buffer:
+        return output.getvalue()
+
+
+# ===================================
+# Utility functions related to Frames
+# ===================================
+
+
+def get_parent_frame(frame):
+    """
+    Returns the parent frame of the input frame object; None if not available.
+    """
+    thread = frame.GetThread()
+    parent_found = False
+    for f in thread:
+        if parent_found:
+            return f
+        if f.GetFrameID() == frame.GetFrameID():
+            parent_found = True
+
+    # If we reach here, no parent has been found, return None.
+    return None
+
+
+def get_args_as_string(frame, showFuncName=True):
+    """
+    Returns the args of the input frame object as a string.
+    """
+    # arguments     => True
+    # locals        => False
+    # statics       => False
+    # in_scope_only => True
+    vars = frame.GetVariables(True, False, False, True)  # type of SBValueList
+    args = []  # list of strings
+    for var in vars:
+        args.append("(%s)%s=%s" % (var.GetTypeName(), var.GetName(), var.GetValue()))
+    if frame.GetFunction():
+        name = frame.GetFunction().GetName()
+    elif frame.GetSymbol():
+        name = frame.GetSymbol().GetName()
+    else:
+        name = ""
+    if showFuncName:
+        return "%s(%s)" % (name, ", ".join(args))
+    else:
+        return "(%s)" % (", ".join(args))
+
+
+def print_registers(frame, string_buffer=False):
+    """Prints all the register sets of the frame."""
+
+    output = io.StringIO() if string_buffer else sys.stdout
+
+    print("Register sets for " + str(frame), file=output)
+
+    registerSet = frame.GetRegisters()  # Return type of SBValueList.
+    print(
+        "Frame registers (size of register set = %d):" % registerSet.GetSize(),
+        file=output,
+    )
+    for value in registerSet:
+        # print >> output, value
+        print(
+            "%s (number of children = %d):" % (value.GetName(), value.GetNumChildren()),
+            file=output,
+        )
+        for child in value:
+            print(
+                "Name: %s, Value: %s" % (child.GetName(), child.GetValue()), file=output
+            )
+
+    if string_buffer:
+        return output.getvalue()
+
+
+def get_registers(frame, kind):
+    """Returns the registers given the frame and the kind of registers desired.
+
+    Returns None if there's no such kind.
+    """
+    registerSet = frame.GetRegisters()  # Return type of SBValueList.
+    for value in registerSet:
+        if kind.lower() in value.GetName().lower():
+            return value
+
+    return None
+
+
+def get_GPRs(frame):
+    """Returns the general purpose registers of the frame as an SBValue.
+
+    The returned SBValue object is iterable.  An example:
+        ...
+        from lldbutil import get_GPRs
+        regs = get_GPRs(frame)
+        for reg in regs:
+            print "%s => %s" % (reg.GetName(), reg.GetValue())
+        ...
+    """
+    return get_registers(frame, "general purpose")
+
+
+def get_FPRs(frame):
+    """Returns the floating point registers of the frame as an SBValue.
+
+    The returned SBValue object is iterable.  An example:
+        ...
+        from lldbutil import get_FPRs
+        regs = get_FPRs(frame)
+        for reg in regs:
+            print "%s => %s" % (reg.GetName(), reg.GetValue())
+        ...
+    """
+    return get_registers(frame, "floating point")
+
+
+def get_ESRs(frame):
+    """Returns the exception state registers of the frame as an SBValue.
+
+    The returned SBValue object is iterable.  An example:
+        ...
+        from lldbutil import get_ESRs
+        regs = get_ESRs(frame)
+        for reg in regs:
+            print "%s => %s" % (reg.GetName(), reg.GetValue())
+        ...
+    """
+    return get_registers(frame, "exception state")
+
+
+# ======================================
+# Utility classes/functions for SBValues
+# ======================================
+
+
+class BasicFormatter(object):
+    """The basic formatter inspects the value object and prints the value."""
+
+    def format(self, value, buffer=None, indent=0):
+        if not buffer:
+            output = io.StringIO()
+        else:
+            output = buffer
+        # If there is a summary, it suffices.
+        val = value.GetSummary()
+        # Otherwise, get the value.
+        if val is None:
+            val = value.GetValue()
+        if val is None and value.GetNumChildren() > 0:
+            val = "%s (location)" % value.GetLocation()
+        print(
+            "{indentation}({type}) {name} = {value}".format(
+                indentation=" " * indent,
+                type=value.GetTypeName(),
+                name=value.GetName(),
+                value=val,
+            ),
+            file=output,
+        )
+        return output.getvalue()
+
+
+class ChildVisitingFormatter(BasicFormatter):
+    """The child visiting formatter prints the value and its immediate children.
+
+    The constructor takes a keyword arg: indent_child, which defaults to 2.
+    """
+
+    def __init__(self, indent_child=2):
+        """Default indentation of 2 SPC's for the children."""
+        self.cindent = indent_child
+
+    def format(self, value, buffer=None):
+        if not buffer:
+            output = io.StringIO()
+        else:
+            output = buffer
+
+        BasicFormatter.format(self, value, buffer=output)
+        for child in value:
+            BasicFormatter.format(self, child, buffer=output, indent=self.cindent)
+
+        return output.getvalue()
+
+
+class RecursiveDecentFormatter(BasicFormatter):
+    """The recursive decent formatter prints the value and the decendents.
+
+    The constructor takes two keyword args: indent_level, which defaults to 0,
+    and indent_child, which defaults to 2.  The current indentation level is
+    determined by indent_level, while the immediate children has an additional
+    indentation by inden_child.
+    """
+
+    def __init__(self, indent_level=0, indent_child=2):
+        self.lindent = indent_level
+        self.cindent = indent_child
+
+    def format(self, value, buffer=None):
+        if not buffer:
+            output = io.StringIO()
+        else:
+            output = buffer
+
+        BasicFormatter.format(self, value, buffer=output, indent=self.lindent)
+        new_indent = self.lindent + self.cindent
+        for child in value:
+            if child.GetSummary() is not None:
+                BasicFormatter.format(self, child, buffer=output, indent=new_indent)
+            else:
+                if child.GetNumChildren() > 0:
+                    rdf = RecursiveDecentFormatter(indent_level=new_indent)
+                    rdf.format(child, buffer=output)
+                else:
+                    BasicFormatter.format(self, child, buffer=output, indent=new_indent)
+
+        return output.getvalue()
 
 def load_manual():
 	global inst_map
@@ -158,7 +1214,7 @@ def load_manual():
 					inst_map[inst] = inst_map[ref]
 
 		dlog(f"Manual loaded for architecture: {arch}")
-	
+
 	return True
 
 def run_shell_command(command, shell=True):
@@ -467,11 +1523,11 @@ def hexdump(buf, address):
 			printable += abyte if i != 14 else abyte + '┊'
 
 		print(LINE_FORMATTER.format(row, hexbytes, printable))
-		
+
 		row += 0x10
 		cur += 0x10
 		line = buf[cur:cur+16]
-	
+
 	print(FOOTER)
 
 def swap_unpack_char():
@@ -1405,7 +2461,7 @@ class Mach:
 		def has_nx_heap(self):
 			#do we need to check this??? I'm gonna return TRUE cause of W^X
 			return True if self.flags.bits & MH_NO_HEAP_EXECUTION else True
-		
+
 		def has_nx_stack(self):
 			return False if self.flags.bits & MH_ALLOW_STACK_EXECUTION else True
 
@@ -1436,7 +2492,7 @@ class Mach:
 		def has_restricted(self):
 			#3 cases restrictedBySetGUid, restrictedBySegment, restrictedByEntitlements
 			codesign = run_shell_command(f"codesign -dvvvv '{self.path}'").stderr.decode() #stderr ( :| ) ???
-			
+
 			if codesign and "Authority=Apple Root CA" in codesign:
 				authority = ""
 				for i in codesign.splitlines():
@@ -1454,7 +2510,7 @@ class Mach:
 					return "True (__restrict)"
 
 			return False
-			
+
 		def description(self):
 			return '%#8.8x: %s (%s)' % (self.file_off, self.path, self.arch)
 
@@ -1532,7 +2588,7 @@ class Mach:
 				lc = Mach.EncryptionInfoLoadCommand(lc)
 				lc.unpack(self, data)
 				self.is_encrypted = bool(cryptid)
-				
+
 			lc.skip(data)
 			return lc
 
@@ -2434,7 +3490,7 @@ def dereference(pointer):
 					break
 			if len(s):
 				chain.append(('string', s))
-		
+
 		except:
 			pass
 
@@ -2515,16 +3571,16 @@ def is_stack_suspicious(thread, exception, code, extra):
 	# //If any of these functions are in the stack trace, it's likely that the crash is exploitable.
 	# //It uses a substring match, so we put spaces around the names to prevent false positives.
 	# //the CSMem ones are used a lot by QuickTime.
-	# //objc_msgSend has no space at the end because there are other similar named functions 
+	# //objc_msgSend has no space at the end because there are other similar named functions
 	# //like objc_msgSend_vtable14
-	suspicious_functions = ["__stack_chk_fail","szone_error","CFRelease","CFRetain","_CFRelease","_CFRetain", 
+	suspicious_functions = ["__stack_chk_fail","szone_error","CFRelease","CFRetain","_CFRelease","_CFRetain",
 		"malloc","calloc","realloc", "objc_msgSend",
 		"szone_free","free_small","tiny_free_list_add_ptr","tiny_free_list_remove_ptr",
-		"small_free_list_add_ptr","small_free_list_remove_ptr","large_entries_free_no_lock", 
-		"large_free_no_lock","szone_batch_free","szone_destroy","free", 
+		"small_free_list_add_ptr","small_free_list_remove_ptr","large_entries_free_no_lock",
+		"large_free_no_lock","szone_batch_free","szone_destroy","free",
 		"CSMemDisposeHandle", "CSMemDisposePtr",
 		"_CFStringAppendFormatAndArgumentsAux","WTF::fastFree","WTF::fastMalloc",
-		"WTF::FastCalloc","WTF::FastRealloc"," WTF::tryFastCalloc","WTF::tryFastMalloc",  
+		"WTF::FastCalloc","WTF::FastRealloc"," WTF::tryFastCalloc","WTF::tryFastMalloc",
 		"WTF::tryFastRealloc","WTF::TCMalloc_Central_FreeList","GMfree","GMmalloc_zone_free",
 		"GMrealloc","GMmalloc_zone_realloc","WTFCrashWithSecurityImplication","__chk_fail_overflow"]
 
@@ -2543,16 +3599,16 @@ def is_stack_suspicious(thread, exception, code, extra):
 
 	if funcs:
 		return " ".join(funcs)
-	
+
 	if exception == "EXC_BREAKPOINT":
 		return NO_CHANGE
 
 	return False
-		
+
 def is_near_null(address):
 	if address < 16 * get_host_pagesize():
 		return True
-	
+
 	return False
 
 def flags_to_human(reg_value, value_table):
@@ -2643,7 +3699,7 @@ def capstone_analyze_pc(current_arch, insn, nb_insn):
 class AARCH64(Architecture):
 	arch = "aarch64"
 	mode = "arm"
-	
+
 	flag_register = "cpsr"
 
 	flags_table = {
@@ -2654,7 +3710,7 @@ class AARCH64(Architecture):
 		7: "interrupt",
 		6: "fast"
 	}
-	
+
 	all_registers = [
 		"x0",  "x1",  "x2",  "x3",  "x4",  "x5",  "x6",  "x7",
 		"x8",  "x9",  "x10", "x11", "x12", "x13", "x14", "x15",
@@ -2669,7 +3725,7 @@ class AARCH64(Architecture):
 		"tbnz"	: "Test bit and Branch if Nonzero compares the value of a bit in a general-purpose register with zero, and conditionally branches to a label at a PC-relative offset if the comparison is not equal.",
 		"tbz"	: "Test bit and Branch if Zero compares the value of a test bit with zero, and conditionally branches to a label at a PC- relative offset if the comparison is equal.",
 		}
-	
+
 	return_register 	 = "x0"
 	syscall_register 	 = "x8"
 	syscall_instructions = "svc"
@@ -2687,12 +3743,12 @@ class AARCH64(Architecture):
 					},
 					"EXC_ARITHMETIC" :
 					{
-						0x0: {'title': 'EXC_ARM_FP_UNDEFINED', 'desc': 'Undefined Floating Point Exception'}, 
-						0x1: {'title': 'EXC_ARM_FP_IO', 'desc': 'Invalid Floating Point Operation'}, 
-						0x2: {'title': 'EXC_ARM_FP_DZ', 'desc': 'Floating Point Divide by Zero'}, 
-						0x3: {'title': 'EXC_ARM_FP_OF', 'desc': 'Floating Point Overflow'}, 
-						0x4: {'title': 'EXC_ARM_FP_UF', 'desc': 'Floating Point Underflow'}, 
-						0x5: {'title': 'EXC_ARM_FP_IX', 'desc': 'Inexact Floating Point Result'}, 
+						0x0: {'title': 'EXC_ARM_FP_UNDEFINED', 'desc': 'Undefined Floating Point Exception'},
+						0x1: {'title': 'EXC_ARM_FP_IO', 'desc': 'Invalid Floating Point Operation'},
+						0x2: {'title': 'EXC_ARM_FP_DZ', 'desc': 'Floating Point Divide by Zero'},
+						0x3: {'title': 'EXC_ARM_FP_OF', 'desc': 'Floating Point Overflow'},
+						0x4: {'title': 'EXC_ARM_FP_UF', 'desc': 'Floating Point Underflow'},
+						0x5: {'title': 'EXC_ARM_FP_IX', 'desc': 'Inexact Floating Point Result'},
 						0x6: {'title': 'EXC_ARM_FP_ID', 'desc': 'Floating Point Denormal Input'}
 					},
 					"EXC_BAD_INSTRUCTION" :
@@ -2707,7 +3763,7 @@ class AARCH64(Architecture):
 
 	def get_code_desc(self, exc, code):
 		crash_code, crash_desc = None, None
-		
+
 		if exc in ['EXC_BAD_INSTRUCTION']:
 			exception	= self.exceptions[exc]
 			crash_code 	= exc
@@ -2718,7 +3774,7 @@ class AARCH64(Architecture):
 			exception 	= self.exceptions[exc]
 			crash_code 	= exception[code]['title']
 			crash_desc	= exception[code]['desc']
-		
+
 		return crash_code, crash_desc
 
 	def is_call(self, insn):
@@ -2739,7 +3795,7 @@ class AARCH64(Architecture):
 		mnemo = insn.mnemonic
 		branch_mnemos = {"cbnz", "cbz", "tbnz", "tbz"}
 		return mnemo.startswith("b.") or mnemo in branch_mnemos
-		
+
 	def is_branch_taken(self, insn):
 		mnemo, operands = insn.mnemonic, insn.operands
 		flags = dict((self.flags_table[k], k) for k in self.flags_table)
@@ -2768,7 +3824,7 @@ class AARCH64(Architecture):
 				i = int(operands[1].imm)
 				if (op & 1<<i) == 0: taken, reason = True, "{}&1<<{}==0".format(reg,i)
 				else: taken, reason = False, "{}&1<<{}!=0".format(reg,i)
-		
+
 		if not reason:
 			taken, reason = self.is_branch_taken_arm(insn)
 		return taken, reason
@@ -2779,7 +3835,7 @@ class AARCH64(Architecture):
 		flags = dict((self.flags_table[k], k) for k in self.flags_table)
 		val = get_register(self.flag_register)
 		taken, reason = False, ""
-		
+
 		if mnemo.endswith("eq"):
 			taken, reason = bool(val&(1<<flags["zero"])), "Z"
 		elif mnemo.endswith("hs"):
@@ -2818,7 +3874,7 @@ class AARCH64(Architecture):
 
 		if insn.mnemonic[:2].lower()=="ld":
 			return "read"
-		
+
 		return "unknown"
 
 	def get_previous_pc(self, pc, frame, process):
@@ -2833,21 +3889,21 @@ class AARCH64(Architecture):
 
 		if reg=="pc":
 			return frame.pc
-		
+
 		if reg=="sp":
 			return frame.sp
-		
+
 		if reg=="fp" or reg=="x29":
 			return frame.fp
-		
+
 		if reg == "lr"  or reg=="x30":
 			return get_register("lr")
-			
+
 		return get_register(reg)
-			
+
 	def get_registers(self, required=[]):
 		gpr = {}
-		
+
 		for reg in self.all_registers:
 			if required == [] or reg in required:
 				gpr[reg.name] = get_register(reg)
@@ -2863,7 +3919,7 @@ class AARCH64(Architecture):
 
 		cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
 		cs.detail   = True
-		
+
 		return cs.disasm(buffer, pc)
 
 	def get_disas_to_print(self, frame, process, pc=None):
@@ -2878,7 +3934,7 @@ class AARCH64(Architecture):
 		insn = instructions[0]
 		av_access_type = self.get_access_type(insn)
 		av_on_branch = False
-		
+
 		for g in insn.groups:
 			if g == capstone.arm64_const.ARM64_GRP_BRANCH_RELATIVE or g == capstone.arm64_const.ARM64_GRP_CALL or g == capstone.arm64_const.ARM64_GRP_JUMP:
 				av_on_branch = True
@@ -2908,7 +3964,7 @@ class AARCH64(Architecture):
 	def disasm(self, address, buffer, pc, lldb_result=None):
 		cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
 		cs.detail  = True
-		
+
 		instuctions = cs.disasm(buffer, address)
 		try:
 			instuctions = list(instuctions)
@@ -2963,7 +4019,7 @@ class X8664(Architecture):
 
 	syscall_register = "rax"
 	syscall_instructions = ["syscall"]
-	
+
 	flags_table = {
 		6: "zero",
 		0: "carry",
@@ -2978,7 +4034,7 @@ class X8664(Architecture):
 		17: "virtualx86",
 		21: "identification",
 	}
-	
+
 	flag_register = "rflags"
 
 	special_registers = ["cs", "ss", "ds", "es", "fs", "gs"]
@@ -3003,7 +4059,7 @@ class X8664(Architecture):
 			"EXC_BAD_ACCESS":
 				{
 					0x1 	:	{"title" : "KERN_INVALID_ADDRESS", "desc": "Specified address is not currently valid."},
-					0x2   	:	{"title":"KERN_PROTECTION_FAILURE", "desc":"Specified memory is valid, but does not permit the required forms of access"},				
+					0x2   	:	{"title":"KERN_PROTECTION_FAILURE", "desc":"Specified memory is valid, but does not permit the required forms of access"},
 					0xd		: 	{ "desc": "general protection fault", "title": "EXC_I386_GPFLT" },
 				},
 			"EXC_BREAKPOINT":
@@ -3019,7 +4075,7 @@ class X8664(Architecture):
 					0xa		: { "desc": "invalid TSS fault", "title": "EXC_I386_INVTSSFLT" },
 					0xb		: { "desc": "segment not present fault", "title": "EXC_I386_SEGNPFLT" },
 					0xc		: { "desc": "stack fault", "title": "EXC_I386_STKFLT" },
-					
+
 					0xe		: { "desc": "page fault", "title": "EXC_I386_PGFLT" },
 					0x10 	: { "desc": "extension error fault", "title": "EXC_I386_EXTERRFLT"},
 					0x11 	: { "desc": "Alignment fault", "title": "EXC_I386_ALIGNFLT" },
@@ -3044,9 +4100,9 @@ class X8664(Architecture):
 			exception 	= self.exceptions[exc]
 			crash_code 	= exception[code]['title']
 			crash_desc	= exception[code]['desc']
-		
+
 		return crash_code, crash_desc
-		
+
 	def flag_register_to_human(self, val=None):
 		reg = self.flag_register
 		if not val:
@@ -3134,7 +4190,7 @@ class X8664(Architecture):
 
 	def get_previous_pc(self, pc, frame, process):
 		disassembly = frame.Disassemble().splitlines()
-		
+
 		for i in range(len(disassembly)):
 			instruction = disassembly[i]
 			if instruction.find(f"{pc:08x}")!=-1 and i!=0:
@@ -3142,7 +4198,7 @@ class X8664(Architecture):
 				address = re.search("0x(.*)?<", instruction).group(1)
 				address = int(address, 16)
 				return address
-			
+
 		return 0
 
 	def get_access_type(self, insn):
@@ -3165,16 +4221,16 @@ class X8664(Architecture):
 
 		error = lldb.SBError()
 		buffer = process.ReadMemory(pc, 20, error)
-		
+
 		cs = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
 		cs.detail   = True
-		
+
 		return cs.disasm(buffer, pc)
 
 	def get_disas_to_print(self, frame, process, pc=None):
 		if pc==None:
 			pc = frame.pc
-		
+
 		instructions = list(self.get_disas(frame, process, pc))
 
 		if instructions == []:
@@ -3209,12 +4265,12 @@ class X8664(Architecture):
 					disassembly_operands += f"{reg}={val:x}; "
 
 		if disassembly_operands:
-			disassembly	=	f"{insn.mnemonic}\t{insn.op_str} => {disassembly_operands}"		
+			disassembly	=	f"{insn.mnemonic}\t{insn.op_str} => {disassembly_operands}"
 		else:
 			disassembly	=	f"{insn.mnemonic}\t{insn.op_str}"
 
 		return disassembly, av_on_branch, av_access_type
-		
+
 	def disasm(self, address, buffer, pc, lldb_result=None):
 		cs = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
 		cs.detail   = True
@@ -3248,7 +4304,7 @@ class X8664(Architecture):
 		print("$rbp : 0x%016x   $rsp : 0x%016x   $rsi : 0x%016x   $rdi : 0x%016x"%(get_register("rbp", frame),  get_register("rsp", frame),  get_register("rsi", frame),  get_register("rdi", frame)))
 		print("$rip : 0x%016x"%(get_register("rip", frame)))
 		print("flags: 0x%016x"%(get_register("rflags", frame)))
-		
+
 
 #################################################################################
 ############################ COMMANDS ###########################################
@@ -3268,7 +4324,7 @@ def process_is_alive(f):
 class ASLRCommand(LLDBCommand):
 	def name(self):
 		return "aslr"
-	
+
 	def args(self):
 		return [
 			CommandArgument(
@@ -3279,17 +4335,17 @@ class ASLRCommand(LLDBCommand):
 
 	def description(self):
 		return "View/modify ASLR setting of target."
-	
+
 	def run(self, arguments, option):
 		launchInfo = lldb.debugger.GetSelectedTarget().GetLaunchInfo()
 		flags 	= launchInfo.GetLaunchFlags()
-		
+
 		if not arguments[0]:
 			if flags & lldb.eLaunchFlagDisableASLR:
 				print(f"{RED}ASLR{RST} : {GRN}off{RST}")
 			else:
 				print(f"{RED}ASLR{RST} : {GRN}on{RST}")
-		
+
 		else:
 			if arguments[0]=="off":
 				# set eLaunchFlagDisableASLR flag
@@ -3306,10 +4362,10 @@ class ASLRCommand(LLDBCommand):
 class ChecksecCommand(LLDBCommand):
 	def name(self):
 		return "checksec"
-	
+
 	def description(self):
 		return "Display the security properties of the current executable"
-	
+
 	def args(self):
 		return [
 			CommandArgument(
@@ -3317,12 +4373,12 @@ class ChecksecCommand(LLDBCommand):
 				type="str",
 				help="Path to mach-o binary. Usage: checksec /usr/bin/qlmanage",
 			)
-		]	
-	
+		]
+
 	def run(self, arguments, option):
 		if not arguments[0]:
 			arguments[0] = lldb.debugger.GetSelectedTarget().GetExecutable().fullpath
-		
+
 		mach = Mach(lldb.debugger)
 		mach.parse(arguments[0])
 		if mach.content:
@@ -3331,10 +4387,10 @@ class ChecksecCommand(LLDBCommand):
 class DisplayMachoHeaderCommand(LLDBCommand):
 	def name(self):
 		return "show_header"
-	
+
 	def description(self):
 		return "Dump Mach-O headers"
-	
+
 	def args(self):
 		return [
 			CommandArgument(
@@ -3343,11 +4399,11 @@ class DisplayMachoHeaderCommand(LLDBCommand):
 				help="Path to mach-o binary. Usage: show_header /usr/bin/qlmanage or macho",
 			)
 		]
-	
+
 	def run(self, arguments, option):
 		if not arguments[0]:
 			arguments[0] = lldb.debugger.GetSelectedTarget().GetExecutable().fullpath
-		
+
 		mach = Mach(lldb.debugger)
 		mach.parse(arguments[0])
 		if mach.content:
@@ -3356,7 +4412,7 @@ class DisplayMachoHeaderCommand(LLDBCommand):
 class DisplayMachoLoadCmdCommand(LLDBCommand):
 	def name(self):
 		return "show_lc"
-	
+
 	def description(self):
 		return "Dump Load Commands from Mach-O"
 
@@ -3368,11 +4424,11 @@ class DisplayMachoLoadCmdCommand(LLDBCommand):
 				help="Path to mach-o binary. Usage: show_lc /usr/bin/qlmanage or macho",
 			)
 		]
-	
+
 	def run(self, arguments, option):
 		if not arguments[0]:
 			arguments[0] = lldb.debugger.GetSelectedTarget().GetExecutable().fullpath
-		
+
 		mach = Mach(lldb.debugger)
 		mach.parse(arguments[0])
 		if mach.content:
@@ -3381,7 +4437,7 @@ class DisplayMachoLoadCmdCommand(LLDBCommand):
 class CapstoneDisassembleCommand(LLDBCommand):
 	def name(self):
 		return "csdis"
-	
+
 	def description(self):
 		return "Disassemble buffer at a given pointer using Capstone"
 
@@ -3398,7 +4454,7 @@ class CapstoneDisassembleCommand(LLDBCommand):
 				help="length of buffer to disassemble",
 			)
 		]
-	
+
 	@process_is_alive
 	def run(self, arguments, option):
 		target 	= lldb.debugger.GetSelectedTarget()
@@ -3424,7 +4480,7 @@ class CapstoneDisassembleCommand(LLDBCommand):
 class ContextCommand(LLDBCommand):
 	def name(self):
 		return "context"
-	
+
 	def description(self):
 		return "Display context of given thread or selected thread by default. Usage: 'context all' or 'context 1'"
 
@@ -3436,7 +4492,7 @@ class ContextCommand(LLDBCommand):
 				help="thread id or all.",
 			)
 		]
-	
+
 	@process_is_alive
 	def run(self, arguments, option):
 		target 	= lldb.debugger.GetSelectedTarget()
@@ -3463,7 +4519,7 @@ class ContextCommand(LLDBCommand):
 		frame 	= thread.GetSelectedFrame()
 
 		address	= frame.pc
-		
+
 		length = 32
 
 		error = lldb.SBError()
@@ -3490,7 +4546,7 @@ class ContextCommand(LLDBCommand):
 class RegisterReadCommand(LLDBCommand):
 	def name(self):
 		return "rr"
-	
+
 	def description(self):
 		return "Display registers for a given thread and frame or selected thread and selected frame by default"
 
@@ -3505,14 +4561,14 @@ class RegisterReadCommand(LLDBCommand):
 				arg="frame",
 				type="int",
 				help="frame id",
-			)			
+			)
 		]
-	
+
 	@process_is_alive
 	def run(self, arguments, option):
 		target 	= lldb.debugger.GetSelectedTarget()
 		process = target.process
-		
+
 		if arguments[0] and arguments[1]:
 			thread_id = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
 			frame_id  = evaluateInputExpression(arguments[1]).GetValueAsUnsigned()
@@ -3530,7 +4586,7 @@ class RegisterReadCommand(LLDBCommand):
 		frame	  = thread.GetFrameAtIndex(frame_id)
 
 		address	= frame.pc
-		
+
 		length = 32
 
 		error = lldb.SBError()
@@ -3564,7 +4620,7 @@ class DisplayStackCommand(LLDBCommand):
 				help="thread id",
 			)
 		]
-	
+
 	@process_is_alive
 	def run(self, arguments, option):
 		target 	= lldb.debugger.GetSelectedTarget()
@@ -3592,7 +4648,7 @@ class DisplayStackCommand(LLDBCommand):
 
 		frame 	= thread.GetFrameAtIndex(frame_id)
 		address	= frame.sp
-		
+
 		error = lldb.SBError()
 		buffer = process.ReadMemory(address, stack_size, error)
 
@@ -3625,7 +4681,7 @@ class DumpStackCommand(LLDBCommand):
 				help="thread id",
 			)
 		]
-	
+
 	@process_is_alive
 	def run(self, arguments, option):
 		self.target 	= lldb.debugger.GetSelectedTarget()
@@ -3634,7 +4690,7 @@ class DumpStackCommand(LLDBCommand):
 
 		if arguments[0]:
 			stack_size = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
-		
+
 		if arguments[0] and arguments[1]:
 			stack_size = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
 			frame_id  = evaluateInputExpression(arguments[1]).GetValueAsUnsigned()
@@ -3648,13 +4704,13 @@ class DumpStackCommand(LLDBCommand):
 			self.print_stack(stack_size, 0, thread, process)
 
 	def print_stack(self, stack_size, frame_id, thread, process):
-		
+
 		frame 	= thread.GetFrameAtIndex(frame_id)
 		address	= frame.sp
-		
+
 		error = lldb.SBError()
 		buffer = process.ReadMemory(address, stack_size, error)
-		
+
 		arch = get_target_arch()
 		if buffer:
 			HEADER = '┌────────────────┬─────────────────────────┬──────────┐'
@@ -3669,7 +4725,7 @@ class DumpStackCommand(LLDBCommand):
 			cur = 0
 			row = address
 			line = buffer[cur:cur+8]
-			
+
 			while line:
 				chain_display = ""
 				addr = struct.unpack("<Q", line)[0]
@@ -3681,13 +4737,13 @@ class DumpStackCommand(LLDBCommand):
 							chain_display += f"{i}{j}"
 
 				line_hex = line.hex().ljust(16)
-				
+
 				hexbytes = ''
 				printable = ''
 				for i in range(0, len(line_hex), 2):
 					hbyte, abyte = cache[line_hex[i:i+2]]
 					hexbytes += hbyte + ' ' if i != 14 else hbyte + ' ┊ '
-					printable += abyte if i != 14 else abyte 
+					printable += abyte if i != 14 else abyte
 
 				print(LINE_FORMATTER.format(row, hexbytes, printable, chain_display))
 				# self.result.PutCString(LINE_FORMATTER.format(row, hexbytes, printable, chain_display))
@@ -3695,11 +4751,11 @@ class DumpStackCommand(LLDBCommand):
 				row += 0x10
 				cur += 0x10
 				line = buffer[cur:cur+8]
-			
+
 			print(FOOTER)
 			# self.result.PutCString(FOOTER)
 
-	
+
 class DisplayMemoryCommand(LLDBCommand):
 	def name(self):
 		return "pmem"
@@ -3721,7 +4777,7 @@ class DisplayMemoryCommand(LLDBCommand):
 				help="size of memory to display",
 			)
 		]
-	
+
 	@process_is_alive
 	def run(self, arguments, option):
 		target 	= lldb.debugger.GetSelectedTarget()
@@ -3731,7 +4787,7 @@ class DisplayMemoryCommand(LLDBCommand):
 
 		if arguments[0]:
 			address = evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
-		
+
 		if arguments[1]:
 			length = evaluateInputExpression(arguments[1]).GetValueAsUnsigned()
 
@@ -3768,7 +4824,7 @@ class ReadMemoryCommand(LLDBCommand):
 				help="size of memory to display",
 			)
 		]
-	
+
 	@process_is_alive
 	def run(self, arguments, option):
 		target 	= lldb.debugger.GetSelectedTarget()
@@ -3781,7 +4837,7 @@ class ReadMemoryCommand(LLDBCommand):
 
 		if arguments[1]:
 			length 	 = evaluateInputExpression(arguments[1]).GetValueAsUnsigned()
-		
+
 		if address and length:
 			self.print_memory(address, length, process)
 
@@ -3800,7 +4856,7 @@ class PrettyBacktraceCommand(LLDBCommand):
 
 	def description(self):
 		return "Pretty print backtrace"
-	
+
 	def args(self):
 		return []
 
@@ -3813,10 +4869,10 @@ class PrettyBacktraceCommand(LLDBCommand):
 
 		frames	=	thread.GetNumFrames()
 		thread_info = f"thread {RED}#{thread.idx}{RST}"
-		
+
 		if thread.queue:
 			thread_info = f"{thread_info} queue = {GRN}'{thread.queue}'{RST}"
-		
+
 		if thread.GetStopReason() == lldb.eStopReasonException:
 			print(f"{thread_info}, stop reason = {RED}{thread.GetStopDescription(1024)}{RST}")
 		elif thread.GetStopReason() != lldb.eStopReasonNone and thread.GetStopReason() != lldb.eStopReasonInvalid:
@@ -3841,7 +4897,7 @@ class PrettyBacktraceCommand(LLDBCommand):
 
 				error = lldb.SBError()
 				buffer = process.ReadMemory(frame.pc, 32, error)
-				
+
 				print(f"{YEL}<disassembly>{RST}")
 				arch.disasm(frame.pc, buffer, frame.pc)
 				print(f"{YEL}</disassembly>{RST}")
@@ -3854,7 +4910,7 @@ class ExploitableCommand(LLDBCommand):
 
 	def description(self):
 		return "Check if the current exception context is exploitable"
-	
+
 	def args(self):
 		return [
 			CommandArgument(
@@ -3884,7 +4940,7 @@ class ExploitableCommand(LLDBCommand):
 		# 	Null dereference(read or write)
 		# 	Other abort
 		# 	Crash on read instruction
-		
+
 		target 	= lldb.debugger.GetSelectedTarget()
 		process = target.GetProcess()
 		thread 	= process.GetSelectedThread()
@@ -3906,7 +4962,7 @@ class ExploitableCommand(LLDBCommand):
 		if arguments[0]:
 			tid 	= evaluateInputExpression(arguments[0]).GetValueAsUnsigned()
 			thread 	= process.GetThreadByIndexID(tid)
-		
+
 		frame 	= thread.GetFrameAtIndex(0)
 		pc 		= frame.pc
 		arch 	= get_target_arch()
@@ -3931,7 +4987,7 @@ class ExploitableCommand(LLDBCommand):
 				exploit_reason 		= "The crash is suspected to be an exploitable issue due to the suspicious function in the stack trace of the crashing thread."
 				av_is_exploitable	= True
 				code = int(code)
-				
+
 				disassembly, _, _	= arch.get_disas_to_print(frame, process)
 
 			elif not is_recursion and exc == "EXC_BAD_ACCESS":
@@ -3970,15 +5026,15 @@ class ExploitableCommand(LLDBCommand):
 						# cw: assumes reads are not exploitable
 						elif av_access_type == "read" and access_address > 0x55555555 - max_offset and access_address < 0x55555555 + max_offset:
 							# It's probably exploitable in the MallocScribble case, but not necessarily in the libgmalloc case.
-							# Don't mark it exploitable, since libgmalloc is used much more than MallocScribble these days. 
+							# Don't mark it exploitable, since libgmalloc is used much more than MallocScribble these days.
 							av_is_exploitable 	= False
 							exploit_reason		= "The access address indicates the use of freed memory if MallocScribble was used, or uninitialized memory if libgmalloc and MALLOC_FILL_SPACE was used."
-						
+
 						elif av_access_type == "read" and access_address > 0xaaaaaaaa - max_offset and access_address < 0xaaaaaaaa + max_offset:
 							# reading an uninitialized pointer isn't necessarily exploitable but it's interesting to note.
 							av_is_exploitable	= False
 							exploit_reason		= "The access address indicates that uninitialized memory was being used if MallocScribble was used."
-						
+
 						# cw: writes assumed as exploitable
 						elif av_access_type == "write":
 							# Crash on write instruction
@@ -3994,9 +5050,9 @@ class ExploitableCommand(LLDBCommand):
 							disassembly, av_on_branch, _	= arch.get_disas_to_print(frame1, process, previous_pc)
 
 				elif code == "EXC_I386_GPFLT":
-					# //When the address would be invalid in the 64-bit ABI, we get a EXC_I386_GPFLT and 
+					# //When the address would be invalid in the 64-bit ABI, we get a EXC_I386_GPFLT and
 					# //the access address shows up as 0.  That shouldn't count as a null deref.
-					# //(0x0000800000000000 to 0xFFFF800000000000 is not addressable, 
+					# //(0x0000800000000000 to 0xFFFF800000000000 is not addressable,
 					# //0xFFFF800000000000 and up is reserved for future kernel use)
 					exploit_reason = "The exception code indicates that the access address was invalid in the 64-bit ABI (it was > 0x0000800000000000)."
 
@@ -4006,21 +5062,21 @@ class ExploitableCommand(LLDBCommand):
 					return
 
 			elif exc == "EXC_BAD_INSTRUCTION":
-				# (lisa:>) disassemble 
+				# (lisa:>) disassemble
 				# libsystem_c.dylib`__chk_fail_overflow:
 				#     0x7fff2036a0fd <+0>:  pushq  %rbp
 				#     0x7fff2036a0fe <+1>:  movq   %rsp, %rbp
 				#     0x7fff2036a101 <+4>:  leaq   0x9c35(%rip), %rdi        ; "detected buffer overflow"
 				#     0x7fff2036a108 <+11>: callq  0x7fff2036abc3            ; _os_crash
 				# ->  0x7fff2036a10d <+16>: ud2
-				
+
 				disassembly, _, _	= arch.get_disas_to_print(frame, process, pc)
 
 			elif exc == "EXC_ARITHMETIC":
-				
+
 				exploit_reason 	= f"Arithmetic exception at {pc:016x}, probably not exploitable."
 				disassembly, _, av_access_type 	= arch.get_disas_to_print(frame, process)
-			
+
 		elif thread.GetStopReason() == lldb.eStopReasonSignal:
 			av_exception = thread.GetStopDescription(1024)
 			stack_suspicious = is_stack_suspicious(thread, None, None, None)
@@ -4030,7 +5086,7 @@ class ExploitableCommand(LLDBCommand):
 				exploit_reason 		= "The crash is suspected to be an exploitable issue due to the suspicious function in the stack trace of the crashing thread."
 				av_is_exploitable	= True
 				disassembly, _, _	= arch.get_disas_to_print(frame, process)
-			
+
 		print(f"crash_code		: {GRN}{crash_code}{RST}")
 		print(f"crash_desc		: {crash_desc}")
 		print(f"av_on_branch		: {YEL}{av_on_branch}{RST}")
@@ -4077,7 +5133,7 @@ class ExploitableCommand(LLDBCommand):
 		if function.find('+ ')!=-1:
 			function = function[:function.find('+ ')]
 
-		#check if there's a function name, else mostly its EIP overwrite 
+		#check if there's a function name, else mostly its EIP overwrite
 		if function=="":
 			return hashlib.md5(address).hexdigest()
 		else:
@@ -4086,7 +5142,7 @@ class ExploitableCommand(LLDBCommand):
 	def proc_stats(self, stats):
 		try:
 			exit_reason = re.search("stop reason =(.+?)\)",stats).group()
-			
+
 			stats = re.search(",(.+?), stop reason =",stats)
 			stats = stats.group(1)[1:]
 			address = stats.split(' ')[0]
@@ -4103,7 +5159,7 @@ class ExploitableCommand(LLDBCommand):
 		except:
 			try:
 				exit_reason = re.search("stop reason =.*",stats).group()
-				
+
 				stats = re.search(",(.+?), stop reason =",stats)
 				stats = stats.group(1)[1:]
 				address = stats.split(' ')[0]
@@ -4117,9 +5173,9 @@ class ExploitableCommand(LLDBCommand):
 
 				EXC = exit_reason[exit_reason.find('stop reason =')+14:]
 				return (EXC[1:],function)
-				
+
 			except:
-				
+
 				return ('False','False')
 
 	#check functions in ['bt 3']
@@ -4152,18 +5208,18 @@ class ExploitableCommand(LLDBCommand):
 					funcs.append(func_)
 				except:
 					funcs.append(self.returnAddress(b))
-				
+
 		hash_= self.hashCalc(funcs)
 		return hash_
 
 class InstructionManualCommand(LLDBCommand):
-	
+
 	def name(self):
 		return "man"
-	
+
 	def description(self):
 		return "Full Instruction Reference Plugin"
-	
+
 	def args(self):
 		return [
 			CommandArgument(
@@ -4209,7 +5265,7 @@ class InstructionManualCommand(LLDBCommand):
 
 		if not arch:
 			arch = get_target_arch().mode
-		
+
 		if not insn:
 			tarch = get_target_arch()
 			address = frame.pc
@@ -4232,13 +5288,1203 @@ class InstructionManualCommand(LLDBCommand):
 		else:
 			errlog(insn + " not documented.")
 
-def __lldb_init_module(debugger, dict):
-	context_title(" lisa ")
+# Custom exception for JSON-RPC errors
+class JSONRPCError(Exception):
+    def __init__(self, code, message, data=None):
+        self.code = code
+        self.message = message
+        self.data = data
+        super().__init__(f"{message} (code {code})")
 
+# Decorator for JSON-RPC methods
+def jsonrpc(func):
+    func._is_jsonrpc = True
+    return func
+
+# LLDB error codes
+class LLDBError:
+    SUCCESS = 0
+    GENERIC = 1
+    PROCESS_NOT_ALIVE = 2
+    TARGET_NOT_FOUND = 3
+    INVALID_ADDRESS = 4
+    MEMORY_READ_ERROR = 5
+
+# Type definitions for JSON-RPC
+class BreakpointLocation(TypedDict):
+    id: int
+    address: int
+    enabled: bool
+    hit_count: int
+    function_name: Optional[str]
+    file: Optional[str]
+    line: Optional[int]
+
+class FrameInfo(TypedDict):
+    id: int
+    pc: int
+    function_name: Optional[str]
+    module: Optional[str]
+    file: Optional[str]
+    line: Optional[int]
+    args: Dict[str, str]
+    locals: Dict[str, str]
+
+class DisassemblyLine(TypedDict):
+    address: int
+    instruction: str
+    operands: str
+    bytes: List[int]
+    is_current: bool
+
+class MemoryData(TypedDict):
+    address: int
+    data: List[int]
+    error: Optional[str]
+
+class ThreadInfo(TypedDict):
+    id: int
+    name: str
+    stop_reason: str
+    frames: List[Dict[str, Any]]
+
+class RegisterInfo(TypedDict):
+    name: str
+    value: str
+
+class DisassembledInstruction(TypedDict):
+    address: str
+    instruction: str
+    operands: str
+
+class BreakpointInfo(TypedDict):
+    id: int
+    enabled: bool
+    locations: List[Dict[str, Any]]
+    hit_count: int
+
+class VariableInfo(TypedDict):
+    name: str
+    type: str
+    value: str
+    has_children: bool
+    children: List['VariableInfo']
+
+def is_process_alive(process):
+    """Check if process is valid and alive"""
+    return (process.IsValid() and
+            process.GetState() != lldb.eStateInvalid and
+            process.GetState() != lldb.eStateExited and
+            process.GetState() != lldb.eStateCrashed)
+
+@jsonrpc
+def create_target(
+    executable_path: Annotated[str, "Path to the executable file"]
+) -> Dict[str, Any]:
+    """Create a debug target from an executable path."""
+    try:
+        global debugger
+        target = debugger.CreateTarget(executable_path)
+        if not target.IsValid():
+            raise JSONRPCError(LLDBError.GENERIC, f"Failed to create target for {executable_path}")
+
+        return {
+            "target_id": target.GetID(),
+            "triple": target.GetTriple(),
+            "executable": target.GetExecutable().GetFilename()
+        }
+    except JSONRPCError:
+        raise
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+@jsonrpc
+def launch_process(
+    args: Annotated[List[str], "Command line arguments for the program"] = [],
+    env: Annotated[Dict[str, str], "Environment variables to set for the program"] = {},
+    working_dir: Annotated[str, "Working directory for the program"] = None,
+    stop_at_entry: Annotated[bool, "Whether to stop at the program entry point"] = True
+) -> Dict[str, Any]:
+    """Launch the process with optional arguments."""
+    try:
+        global debugger_instance
+        target = debugger_instance.GetSelectedTarget()
+        if not target.IsValid():
+            raise JSONRPCError(LLDBError.TARGET_NOT_FOUND, "No valid target. Use create_target first.")
+
+        # Setup launch info
+        launch_info = target.GetLaunchInfo()
+
+        # Set arguments
+        if args:
+            # Make sure all arguments are strings
+            str_args = [str(arg) for arg in args if arg is not None]
+            launch_info.SetArguments(str_args, True)
+
+        # Set environment variables
+        if env:
+            # Make sure keys and values are strings
+            env_list = []
+            for k, v in env.items():
+                if k is not None and v is not None:
+                    env_list.append(f"{str(k)}={str(v)}")
+            if env_list:
+                launch_info.SetEnvironmentEntries(env_list, True)
+
+        # Set working directory
+        if working_dir is not None:
+            launch_info.SetWorkingDirectory(str(working_dir))
+
+        # Set launch flags
+        flags = launch_info.GetLaunchFlags()
+        if stop_at_entry:
+            flags |= lldb.eLaunchFlagStopAtEntry
+        launch_info.SetLaunchFlags(flags)
+
+        # Launch the process
+        error = lldb.SBError()
+        process = target.Launch(launch_info, error)
+
+        if not error.Success():
+            error_msg = error.GetCString() or "Unknown error"
+            raise JSONRPCError(LLDBError.GENERIC, f"Failed to launch process: {error_msg}")
+
+        # Return information about the process
+        state_name = lldb.SBDebugger.StateAsCString(process.GetState()) if process.IsValid() else "invalid"
+
+        return {
+            "process_id": process.GetProcessID() if process.IsValid() else 0,
+            "state": process.GetState() if process.IsValid() else lldb.eStateInvalid,
+            "state_name": state_name,
+            "is_valid": process.IsValid()
+        }
+    except JSONRPCError:
+        raise
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+@jsonrpc
+def attach_to_process(
+    pid: Annotated[int, "Process ID to attach to"]
+) -> Dict[str, Any]:
+    """Attach to a running process by PID."""
+    try:
+        global debugger
+        error = lldb.SBError()
+        target = debugger.CreateTarget("")
+        if not target.IsValid():
+            raise JSONRPCError(LLDBError.TARGET_NOT_FOUND, "Failed to create target")
+
+        process = target.AttachToProcessWithID(debugger.GetListener(), pid, error)
+
+        if not error.Success():
+            raise JSONRPCError(LLDBError.GENERIC, f"Failed to attach to process: {error.GetCString()}")
+
+        return {
+            "process_id": process.GetProcessID(),
+            "state": process.GetState(),
+            "state_name": lldb.SBDebugger.StateAsCString(process.GetState()),
+            "is_valid": process.IsValid()
+        }
+    except JSONRPCError:
+        raise
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+@jsonrpc
+def detach_from_process() -> bool:
+    """Detach from the current process."""
+    try:
+        global debugger
+        target = debugger.GetSelectedTarget()
+        if not target.IsValid():
+            raise JSONRPCError(LLDBError.TARGET_NOT_FOUND, "No valid target")
+
+        process = target.GetProcess()
+        if not process.IsValid():
+            raise JSONRPCError(LLDBError.PROCESS_NOT_ALIVE, "No valid process")
+
+        error = lldb.SBError()
+        result = process.Detach(error)
+
+        if not error.Success():
+            raise JSONRPCError(LLDBError.GENERIC, f"Failed to detach process: {error.GetCString()}")
+
+        return result
+    except JSONRPCError:
+        raise
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+@jsonrpc
+def continue_process() -> Dict[str, Any]:
+    """Continue process execution."""
+    try:
+        global debugger
+        target = debugger.GetSelectedTarget()
+        if not target.IsValid():
+            raise JSONRPCError(LLDBError.TARGET_NOT_FOUND, "No valid target")
+
+        process = target.GetProcess()
+        if not is_process_alive(process):
+            raise JSONRPCError(LLDBError.PROCESS_NOT_ALIVE, "Process is not valid or not alive")
+
+        error = process.Continue()
+        if not error.Success():
+            raise JSONRPCError(LLDBError.GENERIC, f"Failed to continue process: {error.GetCString()}")
+
+        return {
+            "state": process.GetState(),
+            "state_name": lldb.SBDebugger.StateAsCString(process.GetState())
+        }
+    except JSONRPCError:
+        raise
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+@jsonrpc
+def step_over() -> Dict[str, Any]:
+    """Step over current line or instruction."""
+    try:
+        global debugger
+        target = debugger.GetSelectedTarget()
+        if not target.IsValid():
+            raise JSONRPCError(LLDBError.TARGET_NOT_FOUND, "No valid target")
+
+        process = target.GetProcess()
+        if not is_process_alive(process):
+            raise JSONRPCError(LLDBError.PROCESS_NOT_ALIVE, "Process is not valid or not alive")
+
+        thread = process.GetSelectedThread()
+        thread.StepOver()
+
+        return {
+            "state": process.GetState(),
+            "state_name": lldb.SBDebugger.StateAsCString(process.GetState()),
+            "thread_id": thread.GetThreadID(),
+            "pc": thread.GetFrameAtIndex(0).GetPC() if thread.GetNumFrames() > 0 else 0
+        }
+    except JSONRPCError:
+        raise
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+@jsonrpc
+def step_into() -> Dict[str, Any]:
+    """Step into function call."""
+    try:
+        global debugger
+        target = debugger.GetSelectedTarget()
+        if not target.IsValid():
+            raise JSONRPCError(LLDBError.TARGET_NOT_FOUND, "No valid target")
+
+        process = target.GetProcess()
+        if not is_process_alive(process):
+            raise JSONRPCError(LLDBError.PROCESS_NOT_ALIVE, "Process is not valid or not alive")
+
+        thread = process.GetSelectedThread()
+        thread.StepInto()
+
+        return {
+            "state": process.GetState(),
+            "state_name": lldb.SBDebugger.StateAsCString(process.GetState()),
+            "thread_id": thread.GetThreadID(),
+            "pc": thread.GetFrameAtIndex(0).GetPC() if thread.GetNumFrames() > 0 else 0
+        }
+    except JSONRPCError:
+        raise
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+@jsonrpc
+def step_out() -> Dict[str, Any]:
+    """Step out of current function."""
+    try:
+        global debugger
+        target = debugger.GetSelectedTarget()
+        if not target.IsValid():
+            raise JSONRPCError(LLDBError.TARGET_NOT_FOUND, "No valid target")
+
+        process = target.GetProcess()
+        if not is_process_alive(process):
+            raise JSONRPCError(LLDBError.PROCESS_NOT_ALIVE, "Process is not valid or not alive")
+
+        thread = process.GetSelectedThread()
+        thread.StepOut()
+
+        return {
+            "state": process.GetState(),
+            "state_name": lldb.SBDebugger.StateAsCString(process.GetState()),
+            "thread_id": thread.GetThreadID(),
+            "pc": thread.GetFrameAtIndex(0).GetPC() if thread.GetNumFrames() > 0 else 0
+        }
+    except JSONRPCError:
+        raise
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+@jsonrpc
+def set_breakpoint(
+    location: Annotated[str, "Breakpoint specification (e.g., function name, file:line, or address)"]
+) -> Dict[str, Any]:
+    """Set a breakpoint at a specified location."""
+    try:
+        global debugger
+        target = debugger.GetSelectedTarget()
+        if not target.IsValid():
+            raise JSONRPCError(LLDBError.TARGET_NOT_FOUND, "No valid target")
+
+        # Create the breakpoint based on the location format
+        if ":" in location and not location.startswith("0x"):  # file:line format
+            file_path, line_num = location.split(":", 1)
+            try:
+                line_num = int(line_num)
+            except ValueError:
+                raise JSONRPCError(LLDBError.GENERIC, f"Invalid line number in '{location}'")
+
+            breakpoint = target.BreakpointCreateByLocation(file_path, line_num)
+        elif location.startswith("0x"):  # Address format
+            try:
+                address = int(location, 16)
+                breakpoint = target.BreakpointCreateByAddress(address)
+            except ValueError:
+                raise JSONRPCError(LLDBError.GENERIC, f"Invalid address format: '{location}'")
+        else:  # Symbol name format
+            breakpoint = target.BreakpointCreateByName(location)
+
+        if not breakpoint.IsValid() or breakpoint.GetNumLocations() == 0:
+            raise JSONRPCError(LLDBError.GENERIC, f"Failed to set breakpoint at {location}")
+
+        # Format breakpoint information
+        locations = []
+        for i in range(breakpoint.GetNumLocations()):
+            loc = breakpoint.GetLocationAtIndex(i)
+            addr = loc.GetAddress()
+            function = addr.GetFunction()
+            symbol = addr.GetSymbol()
+            line_entry = addr.GetLineEntry()
+
+            loc_info = {
+                "id": loc.GetID(),
+                "address": addr.GetLoadAddress(target),
+                "enabled": loc.IsEnabled(),
+                "hit_count": loc.GetHitCount(),
+                "function_name": function.GetName() if function.IsValid() else symbol.GetName() if symbol.IsValid() else None,
+                "file": line_entry.GetFileSpec().GetFilename() if line_entry.IsValid() else None,
+                "line": line_entry.GetLine() if line_entry.IsValid() else None
+            }
+            locations.append(loc_info)
+
+        return {
+            "breakpoint_id": breakpoint.GetID(),
+            "locations": locations,
+            "pending": breakpoint.GetNumLocations() == 0
+        }
+    except JSONRPCError:
+        raise
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+@jsonrpc
+def delete_breakpoint(
+    breakpoint_id: Annotated[int, "ID of the breakpoint to delete"]
+) -> bool:
+    """Delete a breakpoint by ID."""
+    try:
+        global debugger
+        target = debugger.GetSelectedTarget()
+        if not target.IsValid():
+            raise JSONRPCError(LLDBError.TARGET_NOT_FOUND, "No valid target")
+
+        result = target.BreakpointDelete(breakpoint_id)
+        return result
+    except JSONRPCError:
+        raise
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+@jsonrpc
+def list_breakpoints() -> List[BreakpointInfo]:
+    """List all breakpoints."""
+    try:
+        global debugger
+        target = debugger.GetSelectedTarget()
+        if not target.IsValid():
+            raise JSONRPCError(LLDBError.TARGET_NOT_FOUND, "No valid target")
+
+        result = []
+        for i in range(target.GetNumBreakpoints()):
+            bp = target.GetBreakpointAtIndex(i)
+
+            locations = []
+            for j in range(bp.GetNumLocations()):
+                loc = bp.GetLocationAtIndex(j)
+                addr = loc.GetAddress()
+                function = addr.GetFunction()
+                symbol = addr.GetSymbol()
+                line_entry = addr.GetLineEntry()
+
+                loc_info = {
+                    "id": loc.GetID(),
+                    "address": addr.GetLoadAddress(target),
+                    "enabled": loc.IsEnabled(),
+                    "hit_count": loc.GetHitCount(),
+                    "function_name": function.GetName() if function.IsValid() else symbol.GetName() if symbol.IsValid() else None,
+                    "file": line_entry.GetFileSpec().GetFilename() if line_entry.IsValid() else None,
+                    "line": line_entry.GetLine() if line_entry.IsValid() else None
+                }
+                locations.append(loc_info)
+
+            bp_info = {
+                "id": bp.GetID(),
+                "enabled": bp.IsEnabled(),
+                "hit_count": bp.GetHitCount(),
+                "locations": locations
+            }
+            result.append(bp_info)
+
+        return result
+    except JSONRPCError:
+        raise
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+
+@jsonrpc
+def get_backtrace(
+    thread_id: Annotated[Optional[int], "ID of the thread to get backtrace for"] = None
+) -> List[Dict[str, Any]]:
+    """Get backtrace for current thread or specified thread."""
+    try:
+        global debugger
+
+        target = debugger.GetSelectedTarget()
+        if not target.IsValid():
+            raise JSONRPCError(LLDBError.TARGET_NOT_FOUND, "No valid target")
+
+        process = target.GetProcess()
+        if not is_process_alive(process):
+            raise JSONRPCError(LLDBError.PROCESS_NOT_ALIVE, "Process is not valid or not alive")
+
+        # Get the specified thread or selected thread
+        thread = None
+        if thread_id is not None:
+            for i in range(process.GetNumThreads()):
+                t = process.GetThreadAtIndex(i)
+                if t.GetThreadID() == thread_id:
+                    thread = t
+                    break
+            if not thread:
+                raise JSONRPCError(LLDBError.GENERIC, f"Thread ID {thread_id} not found")
+        else:
+            thread = process.GetSelectedThread()
+
+        # Get detailed frame information
+        frames = []
+        for i in range(thread.GetNumFrames()):
+            frame = thread.GetFrameAtIndex(i)
+
+            # Get function info
+            function = frame.GetFunction()
+            symbol = frame.GetSymbol()
+            module = frame.GetModule()
+
+            # Get source location
+            line_entry = frame.GetLineEntry()
+            file_spec = None
+            if line_entry.IsValid():
+                file_spec = line_entry.GetFileSpec()
+
+            # Create frame info dictionary with safe defaults
+            frame_info = {
+                "id": frame.GetFrameID(),
+                "pc": frame.GetPC(),
+                "function_name": "unknown",
+                "module": "unknown",
+                "file": "unknown",
+                "line": 0,
+                "args_string": "",
+            }
+
+            # Safely populate function name
+            if function.IsValid() and function.GetName():
+                frame_info["function_name"] = function.GetName()
+            elif symbol.IsValid() and symbol.GetName():
+                frame_info["function_name"] = symbol.GetName()
+
+            # Safely populate module
+            if module.IsValid():
+                module_file = module.GetFileSpec()
+                if module_file and module_file.GetFilename():
+                    frame_info["module"] = module_file.GetFilename()
+
+            # Safely populate file and line
+            if file_spec and file_spec.GetFilename():
+                frame_info["file"] = file_spec.GetFilename()
+                if line_entry.GetLine() > 0:
+                    frame_info["line"] = line_entry.GetLine()
+
+            # Try to add args info if possible
+            try:
+                args = []
+                vars = frame.GetVariables(True, False, False, False)  # args only
+                if vars.GetSize() > 0:
+                    for var_idx in range(vars.GetSize()):
+                        var = vars.GetValueAtIndex(var_idx)
+                        if var.IsValid():
+                            name = var.GetName() or "unnamed"
+                            type_name = var.GetTypeName() or "unknown"
+                            value = var.GetValue()
+                            if value is None:
+                                value = var.GetSummary()
+                            if value is None:
+                                value = "null"
+                            args.append(f"{name}={value}")
+
+                    frame_info["args_string"] = ", ".join(args)
+            except:
+                frame_info["args_string"] = "(error getting args)"
+
+            frames.append(frame_info)
+
+        # Only try to add stacktrace to the result if there are any frames
+        if len(frames) > 0:
+            try:
+                frames[0]["stacktrace"] = print_stacktrace(thread, string_buffer=True) or "No stacktrace available"
+            except Exception as e:
+                frames[0]["stacktrace"] = f"Error getting stacktrace: {str(e)}"
+
+        return frames
+    except JSONRPCError:
+        raise
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+@jsonrpc
+def get_variables(
+    frame_id: Annotated[Optional[int], "ID of the frame to get variables for"] = None,
+    thread_id: Annotated[Optional[int], "ID of the thread to get variables for"] = None
+) -> Dict[str, List[VariableInfo]]:
+    """Get variables in current frame."""
+    try:
+        global debugger
+        target = debugger.GetSelectedTarget()
+        if not target.IsValid():
+            raise JSONRPCError(LLDBError.TARGET_NOT_FOUND, "No valid target")
+
+        process = target.GetProcess()
+        if not is_process_alive(process):
+            raise JSONRPCError(LLDBError.PROCESS_NOT_ALIVE, "Process is not valid or not alive")
+
+        # Get the thread
+        thread = None
+        if thread_id is not None:
+            for i in range(process.GetNumThreads()):
+                t = process.GetThreadAtIndex(i)
+                if t.GetThreadID() == thread_id:
+                    thread = t
+                    break
+            if not thread:
+                raise JSONRPCError(LLDBError.GENERIC, f"Thread ID {thread_id} not found")
+        else:
+            thread = process.GetSelectedThread()
+
+        # Get the frame
+        frame = None
+        if frame_id is not None:
+            for i in range(thread.GetNumFrames()):
+                f = thread.GetFrameAtIndex(i)
+                if f.GetFrameID() == frame_id:
+                    frame = f
+                    break
+            if not frame:
+                raise JSONRPCError(LLDBError.GENERIC, f"Frame ID {frame_id} not found")
+        else:
+            frame = thread.GetSelectedFrame()
+
+        def extract_variable_info(var, depth=0, max_depth=2):
+            if depth > max_depth:
+                return {
+                    "name": var.GetName(),
+                    "type": var.GetTypeName(),
+                    "value": "...",
+                    "children": None
+                }
+
+            info = {
+                "name": var.GetName(),
+                "type": var.GetTypeName(),
+                "value": var.GetValue() if var.GetValue() else "None",
+                "children": []
+            }
+
+            # Extract child variables if this is a composite type
+            if var.GetNumChildren() > 0:
+                for i in range(var.GetNumChildren()):
+                    child = var.GetChildAtIndex(i)
+                    if child.IsValid():
+                        info["children"].append(extract_variable_info(child, depth+1, max_depth))
+
+            return info
+
+        # Get all variables using the available LLDB Python API methods
+        arguments = []
+        locals = []
+
+        # Get variables in the frame (includes both arguments and locals)
+        var_list = frame.GetVariables(True, True, True, False)  # args, locals, statics, no-in-scope-only
+
+        for var in var_list:
+            if var.IsValid():
+                # Try to distinguish between arguments and local variables
+                # (This is a heuristic, as LLDB doesn't clearly separate them in some versions)
+                var_info = extract_variable_info(var)
+
+                # We'll consider it an argument if it's at the beginning and has a simple type
+                # This is just a heuristic and may not be accurate
+                if len(arguments) < 8 and var.GetNumChildren() == 0:  # Simple type
+                    arguments.append(var_info)
+                else:
+                    locals.append(var_info)
+
+        # Get registers
+        registers = []
+        for register_set in frame.GetRegisters():
+            for register in register_set:
+                if register.IsValid():
+                    registers.append({
+                        "name": register.GetName(),
+                        "type": register.GetTypeName(),
+                        "value": register.GetValue() if register.GetValue() else "None",
+                        "children": []
+                    })
+
+        return {
+            "arguments": arguments,
+            "locals": locals,
+            "registers": registers
+        }
+    except JSONRPCError:
+        raise
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+@jsonrpc
+def get_disassembly(
+    address: Annotated[Optional[Union[int, str]], "Address to disassemble from (hex string or integer)"] = None,
+    count: Annotated[int, "Number of instructions to disassemble"] = 10
+) -> List[DisassemblyLine]:
+    """Get disassembly around specified address or current PC."""
+    try:
+        global debugger
+        target = debugger.GetSelectedTarget()
+        if not target.IsValid():
+            raise JSONRPCError(LLDBError.TARGET_NOT_FOUND, "No valid target")
+
+        process = target.GetProcess()
+        if not process.IsValid():
+            raise JSONRPCError(LLDBError.PROCESS_NOT_ALIVE, "Process is not valid")
+
+        # Get the address to disassemble
+        addr_value = None
+        if address is None:
+            thread = process.GetSelectedThread()
+            if not thread.IsValid() or thread.GetNumFrames() == 0:
+                raise JSONRPCError(LLDBError.GENERIC, "No valid thread or frame")
+
+            frame = thread.GetFrameAtIndex(0)
+            addr_value = frame.GetPC()
+        else:
+            # Convert address to integer if it's a string
+            if isinstance(address, str):
+                try:
+                    if address.lower().startswith("0x"):
+                        addr_value = int(address, 16)
+                    else:
+                        addr_value = int(address)
+                except ValueError:
+                    raise JSONRPCError(LLDBError.INVALID_ADDRESS, f"Invalid address format: {address}")
+            else:
+                addr_value = address
+
+        # Disassemble
+        instructions = target.ReadInstructions(lldb.SBAddress(addr_value, target), count)
+        if not instructions:
+            raise JSONRPCError(LLDBError.GENERIC, f"Failed to disassemble at address 0x{addr_value:x}")
+
+        # Format the output
+        current_pc = process.GetSelectedThread().GetFrameAtIndex(0).GetPC() if process.IsValid() and process.GetState() != lldb.eStateExited else None
+        disassembly = []
+
+        for instr in instructions:
+            addr = instr.GetAddress().GetLoadAddress(target)
+            mnemonic = instr.GetMnemonic(target) or ""
+            operands = instr.GetOperands(target) or ""
+            comment = instr.GetComment(target) or ""
+            instruction_bytes = []
+
+            # Try to get instruction bytes if possible
+            try:
+                # This gets the raw bytes of the instruction
+                error = lldb.SBError()
+                size = instr.GetByteSize()
+                if size > 0:
+                    bytes_buffer = process.ReadMemory(addr, size, error)
+                    if error.Success() and bytes_buffer:
+                        instruction_bytes = list(bytes_buffer)
+            except:
+                pass  # Ignore errors getting bytes
+
+            disassembly.append({
+                "address": addr,
+                "instruction": mnemonic,
+                "operands": operands,
+                "comment": comment,
+                "bytes": instruction_bytes,
+                "is_current": addr == current_pc
+            })
+
+        return disassembly
+    except JSONRPCError:
+        raise
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+@jsonrpc
+def read_memory(
+    address: Annotated[int, "Address to read memory from"],
+    size: Annotated[int, "Number of bytes to read"]
+) -> MemoryData:
+    """Read memory from the process."""
+    try:
+        global debugger
+        target = debugger.GetSelectedTarget()
+        if not target.IsValid():
+            raise JSONRPCError(LLDBError.TARGET_NOT_FOUND, "No valid target")
+
+        process = target.GetProcess()
+        if not is_process_alive(process):
+            raise JSONRPCError(LLDBError.PROCESS_NOT_ALIVE, "Process is not valid or not alive")
+
+        error = lldb.SBError()
+        memory = process.ReadMemory(address, size, error)
+
+        if error.Fail():
+            # Return partial data if available
+            if memory:
+                return {
+                    "address": address,
+                    "data": list(memory),
+                    "error": error.GetCString()
+                }
+            raise JSONRPCError(LLDBError.MEMORY_READ_ERROR, f"Failed to read memory: {error.GetCString()}")
+
+        return {
+            "address": address,
+            "data": list(memory) if memory else [],
+            "error": None
+        }
+    except JSONRPCError:
+        raise
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+@jsonrpc
+def get_metadata() -> Dict[str, Any]:
+    """Get metadata about the current LLDB debugging session."""
+    try:
+        global debugger
+
+        # Basic debugger info
+        debugger_info = {
+            "version": lldb.SBDebugger.GetVersionString(),
+            "async_mode": debugger.GetAsync()
+        }
+
+        # Target info
+        target = debugger.GetSelectedTarget()
+        target_info = {
+            "has_target": target.IsValid(),
+        }
+
+        if target.IsValid():
+            # Use get_description for detailed target info
+            target_desc = get_description(target, lldb.eDescriptionLevelBrief)
+
+            target_info.update({
+                "description": target_desc,
+                "triple": target.GetTriple() or "unknown",
+                "executable": target.GetExecutable().basename if target.GetExecutable().IsValid() else "unknown",
+                "executable_path": target.GetExecutable().fullpath if target.GetExecutable().IsValid() else "unknown",
+                "num_modules": target.GetNumModules(),
+                "num_breakpoints": target.GetNumBreakpoints()
+            })
+
+            # Process info
+            process = target.GetProcess()
+            process_info = {
+                "has_process": process.IsValid()
+            }
+
+            if process.IsValid():
+                state = process.GetState()
+                state_name = state_type_to_str(state)
+
+                process_info.update({
+                    "pid": process.GetProcessID(),
+                    "state": state,
+                    "state_name": state_name,
+                    "is_stopped": state == lldb.eStateStopped,
+                    "is_running": state == lldb.eStateRunning,
+                    "num_threads": process.GetNumThreads()
+                })
+
+                # Thread info if process is stopped
+                if state == lldb.eStateStopped:
+                    thread = process.GetSelectedThread()
+                    thread_info = {
+                        "has_thread": thread.IsValid()
+                    }
+
+                    if thread.IsValid():
+                        stop_reason = thread.GetStopReason()
+                        stop_reason_name = stop_reason_to_str(stop_reason)
+
+                        thread_info.update({
+                            "thread_id": thread.GetThreadID(),
+                            "thread_name": thread.GetName() or f"Thread {thread.GetIndexID()}",
+                            "stop_reason": stop_reason,
+                            "stop_reason_name": stop_reason_name,
+                            "stop_description": thread.GetStopDescription(100) or "",
+                            "num_frames": thread.GetNumFrames()
+                        })
+
+                        # Frame info
+                        if thread.GetNumFrames() > 0:
+                            frame = thread.GetSelectedFrame()
+                            frame_info = {
+                                "frame_id": frame.GetFrameID(),
+                                "pc": frame.GetPC()
+                            }
+
+                            # Try to get the stacktrace as a string
+                            try:
+                                stacktrace = print_stacktrace(thread, string_buffer=True)
+                                frame_info["stacktrace"] = stacktrace
+                            except:
+                                frame_info["stacktrace"] = "Unable to get stacktrace"
+
+                            # Function info
+                            function = frame.GetFunction()
+                            if function.IsValid():
+                                frame_info["function_name"] = function.GetName() or "unknown"
+                                frame_info["function_mangled"] = function.GetMangledName() or "unknown"
+
+                            # Symbol info (fallback if no function)
+                            elif frame.GetSymbol().IsValid():
+                                frame_info["symbol_name"] = frame.GetSymbol().GetName() or "unknown"
+                                frame_info["symbol_mangled"] = frame.GetSymbol().GetMangledName() or "unknown"
+
+                            # Line entry info
+                            line_entry = frame.GetLineEntry()
+                            if line_entry.IsValid():
+                                file_spec = line_entry.GetFileSpec()
+                                if file_spec.IsValid():
+                                    frame_info["file"] = file_spec.GetFilename() or "unknown"
+                                    frame_info["directory"] = file_spec.GetDirectory() or "unknown"
+                                    frame_info["line"] = line_entry.GetLine()
+                                    frame_info["column"] = line_entry.GetColumn()
+
+                            thread_info["frame"] = frame_info
+
+                    process_info["thread"] = thread_info
+
+            target_info["process"] = process_info
+
+        return {
+            "debugger": debugger_info,
+            "target": target_info
+        }
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+
+@jsonrpc
+def run_lldb_command(
+    command: Annotated[str, "LLDB command to execute"]
+) -> Dict[str, Any]:
+    """Execute an LLDB command and return the output."""
+    try:
+        global debugger
+
+        # Create a return object to capture the output
+        result = lldb.SBCommandReturnObject()
+
+        # Execute the command
+        debugger.GetCommandInterpreter().HandleCommand(command, result)
+
+        return {
+            "success": result.Succeeded(),
+            "output": result.GetOutput() if result.GetOutput() else "",
+            "error": result.GetError() if result.GetError() else None
+        }
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+@jsonrpc
+def evaluate_expression(
+    expression: Annotated[str, "Expression to evaluate"]
+) -> Dict[str, Any]:
+    """Evaluate expression in current context."""
+    try:
+        global debugger
+        target = debugger.GetSelectedTarget()
+        if not target.IsValid():
+            raise JSONRPCError(LLDBError.TARGET_NOT_FOUND, "No valid target")
+
+        process = target.GetProcess()
+        if not is_process_alive(process):
+            raise JSONRPCError(LLDBError.PROCESS_NOT_ALIVE, "Process is not valid or not alive")
+
+        thread = process.GetSelectedThread()
+        if not thread.IsValid() or thread.GetNumFrames() == 0:
+            raise JSONRPCError(LLDBError.GENERIC, "No valid thread or frame")
+
+        frame = thread.GetSelectedFrame()
+
+        # Check if this is likely an LLDB command
+        lldb_commands = ["bt", "thread", "frame", "breakpoint", "register", "memory", "expression",
+                        "watchpoint", "continue", "step", "next", "finish", "quit", "help"]
+
+        first_word = expression.strip().split()[0].lower()
+        if first_word in lldb_commands:
+            return {
+                "success": False,
+                "error": f"'{expression}' appears to be an LLDB command. Use 'run_lldb_command' method instead.",
+                "value": None
+            }
+
+        # Evaluate expression
+        options = lldb.SBExpressionOptions()
+        options.SetIgnoreBreakpoints(True)
+        result = frame.EvaluateExpression(expression, options)
+
+        # Check for errors
+        if result.GetError().Fail():
+            return {
+                "success": False,
+                "error": result.GetError().GetCString(),
+                "value": None
+            }
+
+        # Format the result
+        value_str = None
+        if result.GetValue():
+            value_str = result.GetValue()
+        elif result.GetValueAsSigned() != 0:
+            value_str = str(result.GetValueAsSigned())
+        else:
+            value_str = result.GetSummary() or "None"
+
+        return {
+            "success": True,
+            "error": None,
+            "value": value_str,
+            "type": result.GetTypeName() or "unknown"
+        }
+    except JSONRPCError:
+        raise
+    except Exception as e:
+        raise JSONRPCError(LLDBError.GENERIC, str(e), traceback.format_exc())
+
+# HTTP server for JSON-RPC
+class JSONRPCHandler(BaseHTTPRequestHandler):
+    def log_request(self, code='-', size='-'):
+        # Suppress request logging
+        pass
+
+    def do_POST(self):
+        if self.path != "/mcp":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        content_length = int(self.headers['Content-Length'])
+        post_data = self.rfile.read(content_length).decode('utf-8')
+
+        try:
+            request = json.loads(post_data)
+            method_name = request.get("method")
+            params = request.get("params", [])
+            request_id = request.get("id")
+
+            # Find the method
+            method = None
+            for name, func in globals().items():
+                if hasattr(func, "_is_jsonrpc") and func._is_jsonrpc and name == method_name:
+                    method = func
+                    break
+
+            if not method:
+                response = {
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": -32601,
+                        "message": f"Method '{method_name}' not found"
+                    },
+                    "id": request_id
+                }
+            else:
+                try:
+                    result = method(*params)
+                    response = {
+                        "jsonrpc": "2.0",
+                        "result": result,
+                        "id": request_id
+                    }
+                except JSONRPCError as e:
+                    response = {
+                        "jsonrpc": "2.0",
+                        "error": {
+                            "code": e.code,
+                            "message": e.message,
+                            "data": e.data
+                        },
+                        "id": request_id
+                    }
+                except Exception as e:
+                    response = {
+                        "jsonrpc": "2.0",
+                        "error": {
+                            "code": -32603,
+                            "message": "Internal error",
+                            "data": traceback.format_exc()
+                        },
+                        "id": request_id
+                    }
+        except json.JSONDecodeError:
+            response = {
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32700,
+                    "message": "Parse error"
+                },
+                "id": None
+            }
+
+        # Send response
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+
+        response_data = json.dumps(response).encode('utf-8')
+        self.wfile.write(response_data)
+
+
+
+class MCPCommand(LLDBCommand):
+    _server_thread = None
+    _server_instance = None
+    _server_port = 13338
+
+    def name(self):
+        return "mcp"
+
+    def description(self):
+        return "Control the LLDB JSON-RPC server for remote control"
+
+    def args(self):
+        return [
+            CommandArgument(
+                arg="action",
+                type="str",
+                help="Action to perform (start, stop, status)",
+                default="status"
+            ),
+            CommandArgument(
+                arg="port",
+                type="int",
+                help="Port to run the server on (default: 13338)",
+            )
+        ]
+
+    def run(self, arguments, option):
+        action = "status"
+        port = 13338  # Default port
+
+        # Handle action argument
+        if arguments[0]:
+            action = arguments[0].lower()
+
+        # Handle port argument
+        if len(arguments) > 1 and arguments[1]:
+            try:
+                port = int(arguments[1])
+            except ValueError:
+                errlog(f"Invalid port number: {arguments[1]}")
+                return
+
+        if action == "start":
+            self._start_server(port)
+        elif action == "stop":
+            self._stop_server()
+        elif action == "status":
+            self._show_status()
+        else:
+            errlog(f"Unknown action: {action}")
+            errlog("Available actions: start, stop, status")
+
+    def _start_server(self, port):
+        # Check if server is already running
+        if MCPCommand._server_thread and MCPCommand._server_thread.is_alive():
+            errlog(f"Server is already running on port {MCPCommand._server_port}")
+            return
+
+        def server_thread_func(port):
+            server = HTTPServer(("localhost", port), JSONRPCHandler)
+            MCPCommand._server_instance = server
+            MCPCommand._server_port = port
+            dlog(f"Started LLDB JSON-RPC server on http://localhost:{port}/mcp")
+            try:
+                server.serve_forever()
+            except Exception as e:
+                errlog(f"Server stopped: {e}")
+                MCPCommand._server_instance = None
+
+        # Start the server in a separate thread
+        MCPCommand._server_thread = threading.Thread(target=server_thread_func, args=(port,))
+        MCPCommand._server_thread.daemon = True
+        MCPCommand._server_thread.start()
+
+        dlog(f"LLDB JSON-RPC server started on port {port}")
+
+    def _stop_server(self):
+        if MCPCommand._server_thread and MCPCommand._server_thread.is_alive() and MCPCommand._server_instance:
+            dlog("Stopping LLDB JSON-RPC server...")
+            MCPCommand._server_instance.shutdown()
+            MCPCommand._server_thread.join(timeout=3.0)
+            if MCPCommand._server_thread.is_alive():
+                errlog("Warning: Server thread could not be stopped cleanly")
+            else:
+                dlog("Server stopped successfully")
+            MCPCommand._server_instance = None
+            MCPCommand._server_thread = None
+        else:
+            dlog("Server is not running")
+
+    def _show_status(self):
+        if MCPCommand._server_thread and MCPCommand._server_thread.is_alive():
+            dlog(f"LLDB JSON-RPC server is running on port {MCPCommand._server_port}")
+        else:
+            dlog("LLDB JSON-RPC server is not running")
+
+def __lldb_init_module(dbg, dict):
+	context_title(" lisa ")
+	global debugger
 	global command_iterpreter
 
 	res = lldb.SBCommandReturnObject()
-	command_iterpreter = debugger.GetCommandInterpreter()
+	command_iterpreter = dbg.GetCommandInterpreter()
 
 	command_iterpreter.HandleCommand(f"settings set prompt {__prompt__}", res)
 	command_iterpreter.HandleCommand("settings set stop-disassembly-count 0", res)
@@ -4246,10 +6492,11 @@ def __lldb_init_module(debugger, dict):
 	current_module = sys.modules[__name__]
 	current_module._loadedFunctions = {}
 
+	load_command(current_module, MCPCommand(), "lisa")
 	load_command(current_module, ASLRCommand(), "lisa")
 	load_command(current_module, ContextCommand(), "lisa")
 	load_command(current_module, ChecksecCommand(), "lisa")
-	load_command(current_module, DumpStackCommand(), "lisa")	
+	load_command(current_module, DumpStackCommand(), "lisa")
 	load_command(current_module, ReadMemoryCommand(), "lisa")
 	load_command(current_module, ExploitableCommand(), "lisa")
 	load_command(current_module, DisplayStackCommand(), "lisa")
@@ -4265,3 +6512,5 @@ def __lldb_init_module(debugger, dict):
 
 	command_iterpreter.HandleCommand("target stop-hook add --one-liner 'context'", res)
 	command_iterpreter.HandleCommand("command alias ct context", res)
+
+	debugger = dbg
