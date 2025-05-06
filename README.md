@@ -6,7 +6,7 @@ This project provides a Model-Context Protocol (MCP) integration for LLDB, allow
 
 The integration consists of two main components:
 
-1. **server.py** - An MCP server that communicates with Claude (or other MCP clients)
+1. **lisa.py** - An MCP server that communicates with Claude (or other MCP clients)
 2. **lldb_plugin.py** - A plugin that runs inside LLDB and exposes debugger functionality via JSON-RPC
 
 This architecture allows Claude to help you debug code by directly interacting with LLDB through natural language. The MCP server acts as a bridge, translating Claude's requests into LLDB commands and returning results in a structured format.
@@ -23,7 +23,7 @@ This architecture allows Claude to help you debug code by directly interacting w
 
 1. Clone this repository:
    ```
-   git clone https://github.com/ant4g0nist/lldb-mcp.git
+   git clone https://github.com/ant4g0nist/lisa.py.git
    cd lldb-mcp
    ```
 
@@ -35,7 +35,7 @@ This architecture allows Claude to help you debug code by directly interacting w
    or
 
    ```
-   uv install "fastmcp>=1.2.0" httpx
+   uv pip install "fastmcp>=1.2.0" httpx
    ```
 
 ## Usage
