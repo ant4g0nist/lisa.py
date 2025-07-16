@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/ant4g0nist-lisa-py-badge.png)](https://mseep.ai/app/ant4g0nist-lisa-py)
+
 # LLDB MCP Integration
 
 This project provides a Model-Context Protocol (MCP) integration for LLDB, allowing AI assistants like Claude to interact with your debugging sessions through a standardized interface.
